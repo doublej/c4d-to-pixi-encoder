@@ -12,6 +12,7 @@ import argparse
 import concurrent.futures as futures
 import itertools
 import os
+import re
 import shlex
 import signal
 import sys
@@ -75,11 +76,12 @@ class Quality:
 
 @dataclass
 class SequenceInfo:
-    """A detected numeric frame sequence within a single directory and extension."""
+    """A detected numeric frame sequence."""
     dir_path: Path
     rel_dir: Path
+    prefix: str
     ext: str
-    frames: List[Path]  # sorted numerically by stem
+    frames: List[Path]  # sorted numerically
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -174,15 +176,28 @@ def should_skip_dir(dirname: str) -> bool:
         return True
     return False
 
-def is_numeric_stem(path: Path) -> bool:
-    """Return True if basename without extension is purely numeric (no sign, no spaces)."""
-    return path.stem.isdigit()
+def parse_stem(stem: str) -> Optional[Tuple[str, int]]:
+    """
+    Parses a stem into a sequence prefix and a frame number.
+    Finds a number at the very end of the stem.
+    e.g., "render_001" -> ("render_", 1)
+          "001" -> ("", 1)
+          "no_number" -> None
+    """
+    match = re.search(r"(\d+)$", stem)
+    if not match:
+        return None
+    number_str = match.group(1)
+    prefix = stem[: -len(number_str)]
+    return prefix, int(number_str)
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
     """
-    Walk base_path and detect sequences where filenames are purely numeric
-    and count >= 4, per extension within a directory.
+    Walk base_path and detect frame sequences.
+    A sequence is a series of files in the same directory, with the same extension,
+    and filenames that end in a number (e.g., "render_001.png", "render_002.png").
+    Sequences must have at least 4 frames.
     """
     sequences: List[SequenceInfo] = []
     base = base_path.resolve()
@@ -192,20 +207,38 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
         dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
         dpath = Path(dirpath)
 
-        files = [Path(dirpath) / f for f in filenames]
-        by_ext: Dict[str, List[Path]] = {}
-        for f in files:
-            ext = f.suffix.lower()
-            if ext in SUPPORTED_EXTS and is_numeric_stem(f):
-                by_ext.setdefault(ext, []).append(f)
-
-        for ext, items in by_ext.items():
-            if len(items) < 4:
+        # Group files by (prefix, extension) in this directory
+        potential_sequences: Dict[Tuple[str, str], List[Tuple[int, Path]]] = {}
+        for f_name in filenames:
+            f_path = dpath / f_name
+            ext = f_path.suffix.lower()
+            if ext not in SUPPORTED_EXTS:
                 continue
-            # sort numerically by stem
-            items_sorted = sorted(items, key=lambda p: int(p.stem))
+
+            parsed = parse_stem(f_path.stem)
+            if parsed:
+                prefix, frame_num = parsed
+                potential_sequences.setdefault((prefix, ext), []).append((frame_num, f_path))
+
+        # Filter for actual sequences (>= 4 frames) and create SequenceInfo
+        for (prefix, ext), frames_with_nums in potential_sequences.items():
+            if len(frames_with_nums) < 4:
+                continue
+
+            # Sort by frame number and extract just the paths
+            frames_with_nums.sort(key=lambda item: item[0])
+            sorted_frames = [p for _, p in frames_with_nums]
+
             rel_dir = dpath.relative_to(base)
-            sequences.append(SequenceInfo(dir_path=dpath, rel_dir=rel_dir, ext=ext, frames=items_sorted))
+            sequences.append(
+                SequenceInfo(
+                    dir_path=dpath,
+                    rel_dir=rel_dir,
+                    prefix=prefix,
+                    ext=ext,
+                    frames=sorted_frames,
+                )
+            )
 
     return sequences
 
@@ -217,12 +250,12 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
 def animated_output_path(output_root: Path, seq: SequenceInfo) -> Path:
     """
     Place one .webp per sequence under output_root mirroring the relative directory.
-    To avoid collisions between multiple ext-based sequences in the same folder,
-    suffix the directory name with the extension.
     """
-    # e.g., outputs/webp_renders/<rel_dir>/<dirname>_<ext>.webp
+    # e.g., outputs/webp_renders/<rel_dir>/<prefix_or_dirname>_<ext>.webp
     rel_target_dir = output_root / seq.rel_dir
-    basename = f"{seq.dir_path.name}_{seq.ext.lstrip('.')}.webp"
+    base_name_str = seq.prefix.strip() or seq.dir_path.name
+    base_name = base_name_str.rstrip("._-")
+    basename = f"{base_name}_{seq.ext.lstrip('.')}.webp"
     return rel_target_dir / basename
 
 
@@ -485,7 +518,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     table.add_column("Frames", justify="right")
     table.add_column("Extension")
     for idx, seq in enumerate(sequences, 1):
-        table.add_row(f"{idx:02d}", seq.rel_dir.as_posix() or ".", str(len(seq)), seq.ext)
+        display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+        table.add_row(f"{idx:02d}", display_path, str(len(seq)), seq.ext)
     console.print(table)
 
     stop_ev = threading.Event()
@@ -502,7 +536,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for i, seq in enumerate(sequences, 1):
                 if stop_ev.is_set():
                     break
-                console.print(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {seq.rel_dir.as_posix() or '.'} {seq.ext} ({len(seq)} frames)")
+                display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+                console.print(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)")
                 ok, msg, produced = encode_sequence_individual(
                     seq=seq,
                     out_root=output_dir,
@@ -534,23 +569,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     fut_map[fut] = (i, seq, out_path)
 
                 for fut, (i, seq, out_path) in fut_map.items():
+                    display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
                     try:
                         ok, msg, size = fut.result(timeout=DEFAULT_TIMEOUT_SEC)
                         if ok:
                             successes += 1
                         else:
                             failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {seq.rel_dir.as_posix() or '.'} {seq.ext} -> {out_path.name}")
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {display_path}{seq.ext} -> {out_path.name}")
                         console.print(f"    {msg}")
                         if ok and size is not None:
                             console.print(f"    size: [green]{size:,}[/] bytes")
                     except futures.TimeoutError:
                         failures += 1
                         fut.cancel()
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s: {seq.rel_dir.as_posix()} {seq.ext}", file=sys.stderr)
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}", file=sys.stderr)
                     except Exception as ex:
                         failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR:[/] {type(ex).__name__}: {ex}", file=sys.stderr)
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", file=sys.stderr)
 
     except GracefulExit:
         # Message already printed by signal handler
