@@ -24,6 +24,12 @@ from shutil import which
 from subprocess import CalledProcessError, run
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
+from rich.console import Console
+from rich.panel import Panel
+from rich.table import Table
+
+console = Console()
+
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".exr", ".dpx"}
 
 DEFAULT_OUTPUT = Path("outputs") / "webp_renders"
@@ -418,18 +424,21 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     """Handle Ctrl+C gracefully by setting an event and raising in main thread."""
     def handler(signum, frame):
         stop_event.set()
-        print("\nCtrl+C received. Attempting graceful shutdown...", file=sys.stderr)
+        console.print("\n[yellow]Ctrl+C received. Attempting graceful shutdown...[/]", file=sys.stderr)
         raise GracefulExit()
     signal.signal(signal.SIGINT, handler)
 
 def print_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: int, mode: str, quality: Quality) -> None:
-    print(f"Source:  {base_path.resolve()}")
-    print(f"Output:  {output_dir.resolve()}")
-    print(f"Safety:  {safe_msg or 'ok'}")
-    print(f"Mode:    {'individual-frames' if mode == 'individual' else 'animated'}")
-    print(f"Quality: {quality.mode}")
-    print(f"Workers: {workers} (cap {MAX_WORKER_CAP})")
-    print("-" * 60)
+    table = Table(show_header=False, box=None, padding=(0, 1))
+    table.add_column(style="dim")
+    table.add_column()
+    table.add_row("Source:", str(base_path.resolve()))
+    table.add_row("Output:", str(output_dir.resolve()))
+    table.add_row("Safety:", safe_msg or "ok")
+    table.add_row("Mode:", 'individual-frames' if mode == 'individual' else 'animated')
+    table.add_row("Quality:", quality.mode)
+    table.add_row("Workers:", f"{workers} (cap {MAX_WORKER_CAP})")
+    console.print(Panel(table, title="[bold cyan]Run Configuration[/bold cyan]", border_style="cyan", title_align="left"))
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
@@ -438,10 +447,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if args.check_tools:
         ok, probs = check_tools(require_cwebp=require_cwebp)
         if ok:
-            print("Tools OK: ffmpeg" + (" + cwebp" if require_cwebp else ""))
+            console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
             return 0
         for p in probs:
-            print(f"Missing: {p}", file=sys.stderr)
+            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
     quality = Quality.from_name(args.quality)
@@ -452,14 +461,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     safe, reason = is_safe_output_location(base_path, output_dir)
     if not safe:
-        print(f"Unsafe output location: {reason}", file=sys.stderr)
-        print("No files were written.", file=sys.stderr)
+        console.print(f"[bold red]Unsafe output location:[/] {reason}", file=sys.stderr)
+        console.print("No files were written.", file=sys.stderr)
         return 1
 
     tools_ok, probs = check_tools(require_cwebp=require_cwebp)
     if not tools_ok:
         for p in probs:
-            print(f"Missing: {p}", file=sys.stderr)
+            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
     print_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
@@ -467,13 +476,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     t0 = time.time()
     sequences = find_sequences(base_path)
     if not sequences:
-        print("No numeric sequences (>=4 frames) found. Nothing to do.")
+        console.print("[yellow]No numeric sequences (>=4 frames) found. Nothing to do.[/]")
         return 0
 
-    print(f"Discovered {len(sequences)} sequences:")
+    table = Table(title=f"Discovered {len(sequences)} sequences", show_header=True, header_style="bold magenta")
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Path")
+    table.add_column("Frames", justify="right")
+    table.add_column("Extension")
     for idx, seq in enumerate(sequences, 1):
-        print(f"  [{idx:02d}] {seq.rel_dir.as_posix()}  ({len(seq)} frames, {seq.ext})")
-    print("-" * 60)
+        table.add_row(f"{idx:02d}", seq.rel_dir.as_posix() or ".", str(len(seq)), seq.ext)
+    console.print(table)
 
     stop_ev = threading.Event()
     install_signal_handlers(stop_ev)
@@ -489,7 +502,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for i, seq in enumerate(sequences, 1):
                 if stop_ev.is_set():
                     break
-                print(f"[{i:02d}/{len(sequences)}] INDIV {seq.rel_dir.as_posix()} {seq.ext} ({len(seq)} frames)")
+                console.print(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {seq.rel_dir.as_posix() or '.'} {seq.ext} ({len(seq)} frames)")
                 ok, msg, produced = encode_sequence_individual(
                     seq=seq,
                     out_root=output_dir,
@@ -498,7 +511,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     timeout_sec=DEFAULT_TIMEOUT_SEC,
                 )
                 produced_total += produced
-                print("    " + msg)
+                console.print("    " + msg)
                 if ok:
                     successes += 1
                 else:
@@ -527,33 +540,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             successes += 1
                         else:
                             failures += 1
-                        print(f"[{i:02d}/{len(sequences)}] ANIM  {seq.rel_dir.as_posix()} {seq.ext} -> {out_path.name}")
-                        print(f"    {msg}")
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {seq.rel_dir.as_posix() or '.'} {seq.ext} -> {out_path.name}")
+                        console.print(f"    {msg}")
                         if ok and size is not None:
-                            print(f"    size: {size} bytes")
+                            console.print(f"    size: [green]{size:,}[/] bytes")
                     except futures.TimeoutError:
                         failures += 1
                         fut.cancel()
-                        print(f"[{i:02d}/{len(sequences)}] TIMEOUT after {DEFAULT_TIMEOUT_SEC}s: {seq.rel_dir.as_posix()} {seq.ext}", file=sys.stderr)
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s: {seq.rel_dir.as_posix()} {seq.ext}", file=sys.stderr)
                     except Exception as ex:
                         failures += 1
-                        print(f"[{i:02d}/{len(sequences)}] ERROR: {type(ex).__name__}: {ex}", file=sys.stderr)
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR:[/] {type(ex).__name__}: {ex}", file=sys.stderr)
 
     except GracefulExit:
-        print("Interrupted. Cleaning up...", file=sys.stderr)
-        # rely on executor contexts to clean up
+        # Message already printed by signal handler
+        pass
     except KeyboardInterrupt:
-        print("Interrupted.", file=sys.stderr)
+        console.print("Interrupted.", file=sys.stderr)
     finally:
         pass
 
     total_time = time.time() - t0
     total_sequences = len(sequences)
     avg = (total_time / max(1, total_sequences)) if total_sequences else 0.0
-    print("-" * 60)
-    print(f"Totals: sequences ok={successes}, failed={failures}, time={total_time:.1f}s, avg/seq={avg:.1f}s")
+
+    console.print()
+    summary_table = Table(show_header=False, box=None, padding=(0, 1))
+    summary_table.add_column(style="dim")
+    summary_table.add_column()
+    summary_table.add_row("Sequences OK:", f"[green]{successes}[/]")
+    summary_table.add_row("Sequences Failed:", f"[red]{failures}[/]" if failures else "0")
+    summary_table.add_row("Total Time:", f"{total_time:.1f}s")
+    summary_table.add_row("Avg Time/Seq:", f"{avg:.1f}s")
     if args.individual_frames:
-        print(f"Frames created (this run): {produced_total}")
+        summary_table.add_row("Frames Created:", f"{produced_total:,}")
+
+    console.print(Panel(summary_table, title="[bold cyan]Summary[/bold cyan]", border_style="cyan", title_align="left"))
 
     return 0 if failures == 0 else 1
 
