@@ -366,7 +366,7 @@ def build_ffmpeg_cmd(
     elif format == "avif":
         codec_args = [
             "-c:v", "libsvtav1",
-            "-pix_fmt", "yuv420p10le",
+            "-pix_fmt", "yuva420p",
             "-threads", str(max(1, threads)),
         ]
     else:
@@ -457,7 +457,7 @@ def build_ffmpeg_individual_cmd(src: Path, dst: Path, quality: Quality, format: 
     if format == "webp":
         codec_args = ["-c:v", "libwebp", "-pix_fmt", "yuva420p"]
     elif format == "avif":
-        codec_args = ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le", "-still-picture", "1"]
+        codec_args = ["-c:v", "libsvtav1", "-pix_fmt", "yuva420p", "-still-picture", "1"]
     else:
         raise ValueError(f"Unsupported format for individual encoding: {format}")
 
