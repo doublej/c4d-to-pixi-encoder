@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 from shutil import which
 from subprocess import CalledProcessError, run
+import sys
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import cv2
@@ -175,7 +176,7 @@ def write_ffconcat_file(frame_paths: List[Path], target_dir: Path) -> Path:
     return list_path
 
 
-def run_subprocess(cmd: List[str]) -> Tuple[int, str]:
+def run_subprocess(cmd: List[str], *, log: bool = True) -> Tuple[int, str]:
     """Run a subprocess command, returning (exit_code, pretty_cmd).
 
     Args:
@@ -185,6 +186,15 @@ def run_subprocess(cmd: List[str]) -> Tuple[int, str]:
         Tuple[int, str]: Return code and a shell-quoted pretty string of the command.
     """
     pretty = " ".join(shlex.quote(c) for c in cmd)
+    # Optionally log ffmpeg commands to stderr before execution for traceability
+    if log:
+        try:
+            tool_name = Path(cmd[0]).name.lower() if cmd else ""
+            if tool_name == "ffmpeg":
+                print(f"[ffmpeg] {pretty}", file=sys.stderr, flush=True)
+        except Exception:
+            # Never let logging failures affect execution
+            pass
     try:
         res = run(cmd, check=True)
         return res.returncode, pretty
@@ -220,6 +230,60 @@ def read_alpha_channel(path: Path) -> Tuple[Optional[np.ndarray], int, int]:
         alpha = img[:, :, 1]
         return alpha, w, h
     return None, w, h
+
+
+def has_any_transparency(path: Path) -> bool:
+    """Return True if the image contains any transparency.
+
+    Args:
+        path (Path): Image file path.
+
+    Returns:
+        bool: True when the image has an alpha channel with any pixel < 255.
+              False when there is no alpha channel or alpha is fully opaque.
+    """
+    alpha, w, h = read_alpha_channel(path)
+    if alpha is None or w == 0 or h == 0:
+        return False
+    # Any pixel with alpha < 255 implies transparency presence
+    return bool(np.any(alpha < 255))
+
+
+def sequence_has_any_transparency(paths: Sequence[Path]) -> bool:
+    """Check whether any image in a sequence contains transparency.
+
+    Short-circuits on the first frame that reports transparency.
+
+    Args:
+        paths (Sequence[Path]): Image paths in the sequence.
+
+    Returns:
+        bool: True if any frame has transparency, else False.
+    """
+    for p in paths:
+        try:
+            if has_any_transparency(p):
+                return True
+        except Exception:
+            # Treat read failures as non-transparent for robustness
+            continue
+    return False
+
+
+def image_dimensions(path: Path) -> Tuple[int, int]:
+    """Return (width, height) of an image or (0, 0) on failure.
+
+    Args:
+        path (Path): Image file path.
+
+    Returns:
+        Tuple[int, int]: Width and height in pixels, or (0, 0) if unreadable.
+    """
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return 0, 0
+    h, w = img.shape[:2]
+    return w, h
 
 
 def find_transparent_256_crop(alpha: np.ndarray) -> Tuple[int, int, int, int]:

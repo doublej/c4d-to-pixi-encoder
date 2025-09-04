@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+import sys as _sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -44,6 +45,8 @@ from misc import (
     run_subprocess,
     compute_sequence_256_crop,
     write_offset_json,
+    sequence_has_any_transparency,
+    image_dimensions,
 )
 from dpi_utils import read_sequence_dpi, dpi_dict
 from combine_metadata import combine_to_metadata
@@ -351,7 +354,8 @@ def encode_sequence_animated_task(frame_paths: List[str], out_path: str, quality
         with tempfile.TemporaryDirectory(prefix="webpseq_") as td:
             list_file = write_ffconcat_file([Path(p) for p in frame_paths], Path(td))
             cmd = build_ffmpeg_cmd(list_file, out, q, threads, fmt, crop_rect)
-            code, pretty = run_subprocess(cmd)
+            # Avoid printing from subprocess; parent logs the command via returned message
+            code, pretty = run_subprocess(cmd, log=False)
             if code != 0:
                 return False, f"ffmpeg failed: {pretty}", None
 
@@ -366,7 +370,8 @@ def encode_sequence_animated_task(frame_paths: List[str], out_path: str, quality
                 cw = seq_orig_w
                 ch = seq_orig_h
             _woj(Path(offsets_json), cx, cy, cw, ch, seq_orig_w, seq_orig_h)
-        return True, f"DONE: {out.name} ({size} bytes)", size
+        # Include the command string in success message for visibility in parent logs
+        return True, f"DONE: {out.name} ({size} bytes) | cmd: {pretty}", size
     except Exception as ex:
         return False, f"Exception: {type(ex).__name__}: {ex}", None
 
@@ -560,7 +565,7 @@ def encode_one_frame(
         if code != 0:
             return False, f"FAIL({code}) {pretty}"
 
-        return True, f"ok {dst.name}{message_suffix}"
+        return True, f"ok {dst.name}{message_suffix} | cmd: {pretty}"
     finally:
         # Clean up temporary file if it was created
         if temp_src_file:
@@ -577,11 +582,19 @@ def encode_sequence_individual(seq: SequenceInfo, out_root: Path, quality: Quali
     Convert one sequence to individual frames using thread pool.
     Returns (success, message, produced_count).
     """
-    # Compute sequence-wide crop once (left→right, top→bottom; true wins)
-    cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
-    crop_tuple: Optional[Tuple[int, int, int, int]] = None
-    if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
-        crop_tuple = (cx, cy, cw, ch)
+    # Skip crop computation when the sequence has no transparency
+    if not sequence_has_any_transparency(seq.frames):
+        # No transparency: use full-frame dims from the first image
+        ow, oh = image_dimensions(seq.frames[0])
+        cx = cy = 0
+        cw, ch = ow, oh
+        crop_tuple = None
+    else:
+        # Compute sequence-wide crop once (left→right, top→bottom; true wins)
+        cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
+        crop_tuple = None
+        if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
+            crop_tuple = (cx, cy, cw, ch)
 
     # Build tasks for missing outputs
     tasks: List[Tuple[Path, Path]] = []
@@ -665,6 +678,53 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGINT, handler)
 
 
+def start_controls_listener(pause_event: threading.Event, stop_event: threading.Event) -> threading.Thread:
+    """Start a background thread to listen for simple controls from stdin.
+
+    Controls:
+      - 'p' + Enter: toggle pause/resume
+      - 'q' + Enter: request quit (graceful)
+
+    Returns:
+        Thread: The daemon thread handling input.
+    """
+    import os as _os
+
+    def _reader() -> None:
+        if not _sys.stdin:
+            return
+        try:
+            is_tty = _sys.stdin.isatty()
+        except Exception:
+            is_tty = False
+        # Use line-buffered input to avoid raw mode complexity
+        while not stop_event.is_set():
+            try:
+                line = _sys.stdin.readline()
+                if not line:
+                    # EOF or closed stdin
+                    break
+                cmd = line.strip().lower()
+                if cmd == "p":
+                    if pause_event.is_set():
+                        pause_event.clear()
+                    else:
+                        pause_event.set()
+                elif cmd == "q":
+                    stop_event.set()
+                    try:
+                        # Trigger the SIGINT handler for consistent shutdown path
+                        _os.kill(_os.getpid(), signal.SIGINT)
+                    except Exception:
+                        pass
+            except Exception:
+                break
+
+    t = threading.Thread(target=_reader, name="controls-listener", daemon=True)
+    t.start()
+    return t
+
+
 def create_run_header(config: Config, safe_msg: str) -> Panel:
     """Build the header panel describing the run configuration."""
     table = Table(show_header=False, box=None, padding=(0, 1))
@@ -725,6 +785,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         sequences_table.add_row(f"{idx:02d}", display_path, str(len(seq)), seq.ext)
 
     stop_ev = threading.Event()
+    pause_ev = threading.Event()
     install_signal_handlers(stop_ev)
 
     successes = 0
@@ -743,21 +804,32 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     def get_footer() -> Panel:
         total = successes + failures
         elapsed = time.time() - t0
+        state = "[yellow]PAUSED[/]" if pause_ev.is_set() else "running"
+        controls = "[dim]Controls: 'p' pause/resume, 'q' quit[/dim]"
         return Panel(
                 f"Processed: {total}/{len(sequences)} | "
                 f"Success: [green]{successes}[/] | "
                 f"Failed: [red]{failures}[/] | "
-                f"Elapsed: {elapsed:.1f}s", title="[cyan]Status[/]", border_style="cyan", )
+                f"Elapsed: {elapsed:.1f}s | State: {state}\n{controls}",
+                title="[cyan]Status[/]",
+                border_style="cyan",
+        )
 
     layout["footer"].update(get_footer())
 
     try:
         with Live(layout, screen=True, redirect_stderr=False, refresh_per_second=4) as live:
+            # Start background listener for pause/quit controls
+            _ = start_controls_listener(pause_ev, stop_ev)
             if config.run_mode is RunMode.INDIVIDUAL:
                 # Per-sequence sequential vs threaded per-frame inside
                 for i, seq in enumerate(sequences, 1):
                     if stop_ev.is_set():
                         break
+                    # Pause between sequences if requested
+                    while pause_ev.is_set() and not stop_ev.is_set():
+                        layout["footer"].update(get_footer())
+                        time.sleep(0.2)
                     display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
                     log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)"))
                     layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
@@ -778,6 +850,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 with futures.ProcessPoolExecutor(max_workers=config.workers) as pool:
                     fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
                     for i, seq in enumerate(sequences, 1):
+                        if stop_ev.is_set():
+                            break
+                        while pause_ev.is_set() and not stop_ev.is_set():
+                            layout["footer"].update(get_footer())
+                            time.sleep(0.2)
                         out_path = animated_output_path(config.output_dir, seq, config.format)
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         # Read DPI once per sequence and write sidecar JSON next to the animated output target
@@ -788,11 +865,18 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         except Exception:
                             pass
                         frame_paths = [p.as_posix() for p in seq.frames]
-                        # Compute sequence-wide crop
-                        cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
-                        crop_tuple: Optional[Tuple[int, int, int, int]] = None
-                        if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
-                            crop_tuple = (cx, cy, cw, ch)
+                        # Skip crop when there is no transparency in the sequence
+                        if not sequence_has_any_transparency(seq.frames):
+                            ow, oh = image_dimensions(seq.frames[0])
+                            crop_tuple = None
+                            cx = cy = 0
+                            cw, ch = ow, oh
+                        else:
+                            # Compute sequence-wide crop
+                            cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
+                            crop_tuple: Optional[Tuple[int, int, int, int]] = None
+                            if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
+                                crop_tuple = (cx, cy, cw, ch)
                         offsets_path = out_path.with_suffix(out_path.suffix + ".json")
                         fut = pool.submit(
                             encode_sequence_animated_task,
@@ -809,6 +893,15 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         fut_map[fut] = (i, seq, out_path)
 
                     for fut, (i, seq, out_path) in fut_map.items():
+                        if stop_ev.is_set():
+                            try:
+                                pool.shutdown(cancel_futures=True)
+                            except Exception:
+                                pass
+                            break
+                        while pause_ev.is_set() and not stop_ev.is_set():
+                            layout["footer"].update(get_footer())
+                            time.sleep(0.2)
                         display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
                         try:
                             ok, msg, size = fut.result(timeout=config.timeout_sec)
