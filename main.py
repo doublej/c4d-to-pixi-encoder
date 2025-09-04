@@ -24,10 +24,15 @@ from pathlib import Path
 from shutil import which
 from subprocess import CalledProcessError, run
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+import cv2
+import numpy as np
+
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
+
+
 
 console = Console()
 
@@ -190,6 +195,49 @@ def parse_stem(stem: str) -> Optional[Tuple[str, int]]:
     number_str = match.group(1)
     prefix = stem[: -len(number_str)]
     return prefix, int(number_str)
+
+
+# ------------------------------
+# TIFF validation and processing
+# ------------------------------
+
+
+
+
+def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
+    """
+    Split a 4-channel TIFF file into RGB and alpha components using OpenCV.
+    Returns (success, [rgb_path, alpha_path], error_message).
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    stem = file_path.stem
+
+    rgb_path = output_dir / f"{stem}_rgb.png"
+    alpha_path = output_dir / f"{stem}_alpha.png"
+
+    try:
+        # Read the 4-channel TIFF image
+        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return False, [], "OpenCV could not read the image."
+
+        if img.shape[2] != 4:
+            return False, [], f"Image does not have 4 channels, but {img.shape[2]}."
+
+        # Split the channels
+        b, g, r, a = cv2.split(img)
+        rgb = cv2.merge((r, g, b))
+        
+        # Save the RGB and alpha images
+        cv2.imwrite(str(rgb_path), rgb)
+        cv2.imwrite(str(alpha_path), a)
+
+        return True, [rgb_path, alpha_path], ""
+    except Exception as e:
+        return False, [], f"Exception during channel splitting: {e}"
+
+
+
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
@@ -381,6 +429,59 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
     """Encode one frame, skipping if output exists."""
     if dst.exists():
         return True, f"skip {dst.name}"
+
+    # Handle TIFF files with potential channel issues
+    if src.suffix.lower() in {".tif", ".tiff"}:
+        try:
+            img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
+            if img is not None and img.shape[2] == 4:
+                console.print(f"[blue]Splitting 4-channel TIFF: {src.name}[/]")
+                
+                # Try to split the TIFF into RGB and alpha
+                temp_dir = dst.parent / "temp_split"
+                success, split_files, split_error = split_tiff_channels(src, temp_dir)
+
+                if success and len(split_files) >= 2:
+                    rgb_path, alpha_path = split_files[:2]
+
+                    # Convert RGB to WebP first
+                    rgb_dst = dst.parent / f"{dst.stem}_rgb{quality.mode}.webp"
+                    rgb_cmd = build_cwebp_cmd(rgb_path, rgb_dst, quality)
+                    rgb_code, rgb_pretty = run_subprocess(rgb_cmd)
+
+                    if rgb_code != 0:
+                        return False, f"FAIL RGB({rgb_code}) {rgb_pretty}"
+
+                    # Convert alpha to WebP
+                    alpha_dst = dst.parent / f"{dst.stem}_alpha{quality.mode}.webp"
+                    alpha_cmd = build_cwebp_cmd(alpha_path, alpha_dst, quality)
+                    alpha_code, alpha_pretty = run_subprocess(alpha_cmd)
+
+                    if alpha_code != 0:
+                        return False, f"FAIL Alpha({alpha_code}) {alpha_pretty}"
+
+                    # For now, just use the RGB version as the main output
+                    # TODO: Implement alpha recombination for WebP
+                    import shutil
+                    shutil.copy2(rgb_dst, dst)
+
+                    # Clean up temp files
+                    try:
+                        rgb_path.unlink(missing_ok=True)
+                        alpha_path.unlink(missing_ok=True)
+                        rgb_dst.unlink(missing_ok=True)
+                        alpha_dst.unlink(missing_ok=True)
+                        temp_dir.rmdir()
+                    except:
+                        pass
+
+                    return True, f"ok {dst.name} (split channels)"
+                else:
+                    return False, f"Channel splitting failed: {split_error}"
+        except Exception as e:
+            console.print(f"[yellow]Could not process TIFF {src.name} with OpenCV: {e}[/]")
+
+    # Normal processing for other formats
     cmd = build_cwebp_cmd(src, dst, quality)
     code, pretty = run_subprocess(cmd)
     if code != 0:
@@ -457,7 +558,7 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     """Handle Ctrl+C gracefully by setting an event and raising in main thread."""
     def handler(signum, frame):
         stop_event.set()
-        console.print("\n[yellow]Ctrl+C received. Attempting graceful shutdown...[/]", file=sys.stderr)
+        console.print("\n[yellow]Ctrl+C received. Attempting graceful shutdown...[/]")
         raise GracefulExit()
     signal.signal(signal.SIGINT, handler)
 
@@ -477,14 +578,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     require_cwebp = bool(args.individual_frames)
-    if args.check_tools:
-        ok, probs = check_tools(require_cwebp=require_cwebp)
-        if ok:
-            console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
-            return 0
-        for p in probs:
-            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
-        return 1
+     if args.check_tools:
+         ok, probs = check_tools(require_cwebp=require_cwebp)
+         if ok:
+             console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
+             return 0
+         for p in probs:
+             console.print(f"[bold red]Missing:[/] {p}")
+         return 1
 
     quality = Quality.from_name(args.quality)
     workers = pick_worker_count(args.max_workers, args.sequential)
@@ -492,17 +593,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     base_path = args.base_path
     output_dir = args.output_dir
 
-    safe, reason = is_safe_output_location(base_path, output_dir)
-    if not safe:
-        console.print(f"[bold red]Unsafe output location:[/] {reason}", file=sys.stderr)
-        console.print("No files were written.", file=sys.stderr)
-        return 1
+     safe, reason = is_safe_output_location(base_path, output_dir)
+     if not safe:
+         console.print(f"[bold red]Unsafe output location:[/] {reason}")
+         console.print("No files were written.")
+         return 1
 
-    tools_ok, probs = check_tools(require_cwebp=require_cwebp)
-    if not tools_ok:
-        for p in probs:
-            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
-        return 1
+     tools_ok, probs = check_tools(require_cwebp=require_cwebp)
+     if not tools_ok:
+         for p in probs:
+             console.print(f"[bold red]Missing:[/] {p}")
+         return 1
 
     print_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
 
@@ -582,17 +683,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             console.print(f"    size: [green]{size:,}[/] bytes")
                     except futures.TimeoutError:
                         failures += 1
-                        fut.cancel()
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}", file=sys.stderr)
-                    except Exception as ex:
-                        failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", file=sys.stderr)
+                         fut.cancel()
+                         console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}")
+                     except Exception as ex:
+                         failures += 1
+                         console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
 
     except GracefulExit:
         # Message already printed by signal handler
         pass
-    except KeyboardInterrupt:
-        console.print("Interrupted.", file=sys.stderr)
+     except KeyboardInterrupt:
+         console.print("Interrupted.")
     finally:
         pass
 
