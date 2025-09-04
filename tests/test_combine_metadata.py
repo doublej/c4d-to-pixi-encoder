@@ -35,11 +35,6 @@ def test_combine_and_log(tmp_path: Path):
     assert data["foo"] == "bar"
     assert data["source_folder"] == str(frames)
     assert data["frame_count"] == 3
-    assert isinstance(data.get("processing_log"), list)
-    steps = [e["step"] for e in data["processing_log"]]
-    assert "validate_inputs" in steps
-    assert "load_json" in steps
-    assert "merge" in steps
-    assert "derive_source" in steps
-    assert "write_output" in steps
-
+    # Sidecar JSON files should be removed, leaving only metadata.json
+    remaining = sorted([p.name for p in outdir.glob("*.json")])
+    assert remaining == ["metadata.json"]

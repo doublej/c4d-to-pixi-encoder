@@ -397,32 +397,65 @@ def build_ffmpeg_individual_cmd(
             return None
 
         color_crf = extract_crf(quality.ffmpeg_args) or "26"
-        crop_expr = None
-        if crop_rect is not None:
-            x, y, w, h = crop_rect
-            crop_expr = f"[0:v]crop={w}:{h}:{x}:{y}"
-        filter_chain = (
-            (crop_expr + ",split=2[c][asrc]") if crop_expr else "[0:v]split=2[c][asrc]"
-        ) + ";[asrc]alphaextract[a]"
+        # Detect whether TIFF has an alpha channel; if not, avoid alphaextract
+        try:
+            from misc import read_alpha_channel as _rac
+            alpha_arr, _w, _h = _rac(src)
+            has_alpha = alpha_arr is not None
+        except Exception:
+            has_alpha = False
 
-        return [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-nostdin",
-            "-i", str(src),
-            "-filter_complex", filter_chain,
-            "-map", "[c]",
-            "-map", "[a]",
-            "-frames:v", "1",
-            "-c:v", "libaom-av1",
-            "-still-picture", "1",
-            "-pix_fmt:0", "yuv444p12le",
-            "-crf:0", color_crf,
-            "-pix_fmt:1", "gray12le",
-            "-crf:1", "0",
-            str(dst),
-        ]
+        if not has_alpha:
+            # No alpha → encode color only, optional crop, no alphaextract
+            base = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-nostdin",
+                "-i", str(src),
+                "-an",
+                "-frames:v", "1",
+                "-c:v", "libaom-av1",
+                "-still-picture", "1",
+                "-pix_fmt", "yuv444p12le",
+                "-crf", color_crf,
+            ]
+            vf = None
+            if crop_rect is not None:
+                x, y, w, h = crop_rect
+                vf = f"crop={w}:{h}:{x}:{y}"
+            if vf is not None:
+                base.extend(["-vf", vf])
+            base.append(str(dst))
+            return base
+        else:
+            # Has alpha → split and encode color+alpha (alpha lossless)
+            crop_expr = None
+            if crop_rect is not None:
+                x, y, w, h = crop_rect
+                crop_expr = f"[0:v]crop={w}:{h}:{x}:{y}"
+            # Ensure we always have an alpha plane for extraction
+            head = (crop_expr or "[0:v]") + ",format=rgba"
+            filter_chain = f"{head},split=2[c][asrc];[asrc]alphaextract[a]"
+
+            return [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel", "error",
+                "-nostdin",
+                "-i", str(src),
+                "-filter_complex", filter_chain,
+                "-map", "[c]",
+                "-map", "[a]",
+                "-frames:v", "1",
+                "-c:v", "libaom-av1",
+                "-still-picture", "1",
+                "-pix_fmt:0", "yuv444p12le",
+                "-crf:0", color_crf,
+                "-pix_fmt:1", "gray12le",
+                "-crf:1", "0",
+                str(dst),
+            ]
 
     # AVIF + PNG: preserve transparency using explicit alpha extraction
     if fmt is OutputFormat.AVIF and src.suffix.lower() in {".png"}:

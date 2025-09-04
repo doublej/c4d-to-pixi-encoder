@@ -14,7 +14,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 
 # -----------------------------
@@ -164,7 +164,7 @@ def _parse_trailing_number(stem: str) -> Tuple[Optional[str], Optional[int]]:
 
 
 def build_output_payload(
-    merged: Dict, source_folder: Optional[Path], frame_count: Optional[int], processing_log: List[Dict[str, str]]
+    merged: Dict, source_folder: Optional[Path], frame_count: Optional[int]
 ) -> Dict:
     """Assemble the final `metadata.json` payload.
 
@@ -180,7 +180,6 @@ def build_output_payload(
     payload.update(merged)
     payload["source_folder"] = str(source_folder) if source_folder else None
     payload["frame_count"] = int(frame_count) if frame_count is not None else None
-    payload["processing_log"] = processing_log
     return payload
 
 
@@ -203,39 +202,30 @@ def combine_to_metadata(dir_path: Path, srcname: str, output_name: str = "metada
         FileNotFoundError: When expected input files are missing.
         ValueError: When input JSONs are not objects.
     """
-    log: List[Dict[str, str]] = []
-
-    def log_step(step: str, detail: str) -> None:
-        """Append a processing step to the in-memory log."""
-        log.append({"step": step, "detail": detail})
-
     pair = build_pair_paths(dir_path, srcname)
     validate_pair_exists(pair)
-    log_step("validate_inputs", f"Found {pair.dpi_json.name} and {pair.meta_json.name}")
 
     dpi_data = load_json(pair.dpi_json)
-    log_step("load_json", f"Loaded {pair.dpi_json.name}")
     meta_data = load_json(pair.meta_json)
-    log_step("load_json", f"Loaded {pair.meta_json.name}")
 
     # Merge with meta_data taking precedence on key conflicts.
     merged = shallow_merge(dpi_data, meta_data)
-    log_step("merge", "Merged dpi and meta with meta overriding")
 
     # Derive source folder and frame count from the DPI payload.
     source_folder, frame_count = derive_source_folder_and_frame_count(dpi_data)
-    if source_folder is not None and frame_count is not None:
-        log_step("derive_source", f"Source folder {source_folder} with {frame_count} frames")
-    else:
-        log_step("derive_source", "No source_path provided; skipped frame counting")
-
-    payload = build_output_payload(merged, source_folder, frame_count, processing_log=log)
+    
+    payload = build_output_payload(merged, source_folder, frame_count)
 
     out_path = dir_path / output_name
-    # Log the write step before writing so it appears in the saved log
-    log_step("write_output", f"Writing {out_path.name}")
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2)
+    # Cleanup: remove all JSON files in dir_path except the output_name
+    for p in dir_path.glob("*.json"):
+        if p.name != output_name:
+            try:
+                p.unlink(missing_ok=True)
+            except Exception:
+                pass
     return out_path
 
 

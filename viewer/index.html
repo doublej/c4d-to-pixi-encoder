@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sequence Layer Viewer</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; display: flex; height: 100vh; }
+    #sidebar { width: 320px; overflow-y: auto; border-right: 1px solid #ddd; padding: 12px; box-sizing: border-box; }
+    #main { position: relative; flex: 1; display: flex; align-items: center; justify-content: center; background:#111; }
+    #stage { position: relative; }
+    .layer { position: absolute; top: 0; left: 0; }
+    .panel { border-bottom: 1px solid #eee; padding: 8px 0; }
+    .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+    .name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    input[type="range"] { width: 100%; }
+    label { font-size: 12px; color: #444; }
+    #controls { padding-bottom: 8px; border-bottom: 1px solid #ddd; margin-bottom: 8px; }
+    #status { color: #888; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div id="sidebar">
+    <div id="controls">
+      <div class="row"><button id="fit">Fit to first frame</button></div>
+      <div class="row"><label><input type="checkbox" id="sync"> Sync all sliders</label></div>
+      <div id="status"></div>
+    </div>
+    <div id="layers"></div>
+  </div>
+  <div id="main">
+    <div id="stage"></div>
+  </div>
+
+  <script>
+  const state = { sequences: [], sync: false };
+
+  async function loadManifest() {
+    const res = await fetch('manifest.json');
+    const data = await res.json();
+    state.sequences = data.map((seq, idx) => ({ ...seq, index: 0, visible: true, idx, offsetX: seq.offsetX||0, offsetY: seq.offsetY||0 }));
+    renderUI();
+    await renderStage();
+  }
+
+  function createImg(seq) {
+    const img = document.createElement('img');
+    img.className = 'layer';
+    img.style.display = seq.visible ? 'block' : 'none';
+    img.style.position = 'absolute';
+    img.style.left = '0px';
+    img.style.top = '0px';
+    img.style.transform = `translate(${(seq.offsetX||0)}px, ${(seq.offsetY||0)}px)`;
+    img.style.zIndex = String(seq.idx || 0);
+    img.src = seq.frames[seq.index];
+    img.dataset.seqId = seq.id;
+    img.decoding = 'async';
+    return img;
+  }
+
+  async function renderStage() {
+    const stage = document.getElementById('stage');
+    stage.innerHTML = '';
+    // Determine stage size from max of origW/origH if provided
+    const maxW = Math.max(0, ...state.sequences.map(s => s.origW||0));
+    const maxH = Math.max(0, ...state.sequences.map(s => s.origH||0));
+    if (maxW > 0 && maxH > 0) {
+      stage.style.width = maxW + 'px';
+      stage.style.height = maxH + 'px';
+    }
+
+    for (const seq of state.sequences) {
+      const img = createImg(seq);
+      stage.appendChild(img);
+      // If stage has no explicit size, size it from the first loaded image
+      if (stage.childElementCount === 1 && !(maxW>0 && maxH>0)) {
+        await img.decode().catch(()=>{});
+        stage.style.width = img.naturalWidth + 'px';
+        stage.style.height = img.naturalHeight + 'px';
+      }
+    }
+    updateStatus();
+  }
+
+  function updateStatus() {
+    const st = document.getElementById('status');
+    const total = state.sequences.length;
+    const frames = state.sequences.map(s => s.frames.length).reduce((a,b)=>a+b,0);
+    st.textContent = `${total} sequences, ${frames} frames`;
+  }
+
+  function renderUI() {
+    const layers = document.getElementById('layers');
+    layers.innerHTML = '';
+    state.sequences.forEach((seq, i) => {
+      const panel = document.createElement('div');
+      panel.className = 'panel';
+
+      const title = document.createElement('div');
+      title.className = 'row name';
+      title.textContent = seq.name;
+      panel.appendChild(title);
+
+      const row1 = document.createElement('div');
+      row1.className = 'row';
+      const vis = document.createElement('input');
+      vis.type = 'checkbox';
+      vis.checked = seq.visible;
+      vis.addEventListener('change', () => {
+        seq.visible = vis.checked;
+        const img = document.querySelector(`img.layer[data-seq-id="${seq.id}"]`);
+        if (img) img.style.display = seq.visible ? 'block' : 'none';
+      });
+      const visLabel = document.createElement('label'); visLabel.textContent = 'Visible';
+      row1.appendChild(vis); row1.appendChild(visLabel);
+      panel.appendChild(row1);
+
+      const row2 = document.createElement('div');
+      row2.className = 'row';
+      const slider = document.createElement('input');
+      slider.type = 'range';
+      slider.min = 0; slider.max = Math.max(0, seq.frames.length - 1);
+      slider.value = seq.index;
+      const lbl = document.createElement('span');
+      lbl.textContent = `${seq.index+1}/${seq.frames.length}`;
+      slider.addEventListener('input', () => {
+        const idx = parseInt(slider.value, 10) || 0;
+        if (state.sync) {
+          state.sequences.forEach(s => { s.index = Math.min(idx, s.frames.length-1); });
+          document.querySelectorAll('#layers input[type=range]').forEach((el, j) => {
+            const s = state.sequences[j]; el.value = s.index; el.nextSibling.textContent = `${s.index+1}/${s.frames.length}`;
+          });
+          document.querySelectorAll('img.layer').forEach((img, j) => {
+            const s = state.sequences[j]; img.src = s.frames[s.index];
+          });
+        } else {
+          seq.index = idx; lbl.textContent = `${seq.index+1}/${seq.frames.length}`;
+          const img = document.querySelector(`img.layer[data-seq-id="${seq.id}"]`);
+          if (img) img.src = seq.frames[seq.index];
+        }
+      });
+      row2.appendChild(slider); row2.appendChild(lbl);
+      panel.appendChild(row2);
+
+      layers.appendChild(panel);
+    });
+
+    document.getElementById('sync').addEventListener('change', (e) => {
+      state.sync = e.target.checked;
+    });
+
+    document.getElementById('fit').addEventListener('click', async () => {
+      const first = document.querySelector('#stage img.layer');
+      if (!first) return;
+      await first.decode().catch(()=>{});
+      const stage = document.getElementById('stage');
+      stage.style.width = first.naturalWidth + 'px';
+      stage.style.height = first.naturalHeight + 'px';
+    });
+  }
+
+  loadManifest();
+  </script>
+</body>
+<link rel="preload" as="fetch" href="manifest.json" crossorigin="anonymous" />
+</html>
