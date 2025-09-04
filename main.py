@@ -140,9 +140,6 @@ def check_tools(require_cwebp: bool) -> Tuple[bool, List[str]]:
         problems.append("ffmpeg not found in PATH")
     if require_cwebp and which("cwebp") is None:
         problems.append("cwebp not found in PATH (required for --individual-frames)")
-    # Check for ImageMagick for TIFF processing
-    if which("convert") is None:
-        problems.append("ImageMagick (convert) not found in PATH (recommended for TIFF channel splitting)")
     return (len(problems) == 0, problems)
 
 
@@ -212,90 +209,18 @@ def validate_tiff_file(file_path: Path) -> Tuple[bool, str]:
     """
     Check if a TIFF file has valid metadata for ffmpeg processing.
     Returns (is_valid, error_message).
+    (STUBBED - always returns True)
     """
-    if not PIL_AVAILABLE:
-        # Fallback: try to read with ffmpeg directly
-        cmd = ["ffmpeg", "-i", str(file_path), "-f", "null", "-"]
-        result = run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, f"ffmpeg cannot read file: {result.stderr}"
-        return True, ""
-
-    try:
-        with Image.open(file_path) as img:
-            # Check TIFF tags if available
-            if hasattr(img, 'tag_v2'):
-                # Check photometric interpretation and samples per pixel
-                photometric = img.tag_v2.get(262)  # PhotometricInterpretation
-                samples_per_pixel = img.tag_v2.get(277)  # SamplesPerPixel
-
-                if photometric is not None and samples_per_pixel is not None:
-                    photometric_val = photometric[0] if isinstance(photometric, tuple) else photometric
-                    spp_val = samples_per_pixel[0] if isinstance(samples_per_pixel, tuple) else samples_per_pixel
-
-                    # RGB photometric (2) should have 3 samples, RGBA (2) can have 4
-                    # But if photometric is 2 and samples > 3, it's invalid for ffmpeg
-                    if photometric_val == 2 and spp_val > 3:
-                        return False, f"RGB photometric with {spp_val} samples/pixel (expected 3)"
-
-            # Also check if PIL can read it but ffmpeg might have issues
-            # If the image has alpha channel but RGB photometric, it's problematic
-            if hasattr(img, 'mode') and img.mode in ['RGBA', 'LA', 'P']:
-                # Check if it has an alpha channel
-                if img.mode in ['RGBA', 'LA'] or (hasattr(img, 'getpixel') and len(img.getpixel((0, 0))) > 3):
-                    # This might be problematic for ffmpeg
-                    return False, f"Image has alpha channel but may have photometric mismatch"
-
-            return True, ""
-    except Exception as e:
-        return False, f"Cannot read TIFF file: {e}"
+    return True, ""
 
 
 def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
     """
     Split a TIFF file with channel issues into RGB and alpha components.
     Returns (success, [rgb_path, alpha_path], error_message).
+    (STUBBED - always returns False)
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    stem = file_path.stem
-
-    rgb_path = output_dir / f"{stem}_rgb.png"
-    alpha_path = output_dir / f"{stem}_alpha.png"
-
-    try:
-        # Use ImageMagick to split channels
-        # Extract RGB channels
-        rgb_cmd = ["convert", str(file_path), "-channel", "RGB", str(rgb_path)]
-        result = run(rgb_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, [], f"Failed to extract RGB: {result.stderr}"
-
-        # Extract alpha channel
-        alpha_cmd = ["convert", str(file_path), "-channel", "A", str(alpha_path)]
-        result = run(alpha_cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            return False, [], f"Failed to extract alpha: {result.stderr}"
-
-        return True, [rgb_path, alpha_path], ""
-    except Exception as e:
-        return False, [], f"Exception during channel splitting: {e}"
-
-
-def check_tools_extended(require_cwebp: bool) -> Tuple[bool, List[str]]:
-    """Extended tool check including ImageMagick for TIFF processing."""
-    problems = []
-
-    # Check existing tools
-    if which("ffmpeg") is None:
-        problems.append("ffmpeg not found in PATH")
-    if require_cwebp and which("cwebp") is None:
-        problems.append("cwebp not found in PATH (required for --individual-frames)")
-
-    # Check ImageMagick for TIFF processing
-    if which("convert") is None:
-        problems.append("ImageMagick (convert) not found in PATH (required for TIFF channel splitting)")
-
-    return len(problems) == 0, problems
+    return False, [], "Channel splitting is disabled."
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
@@ -488,56 +413,7 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
     if dst.exists():
         return True, f"skip {dst.name}"
 
-    # Handle TIFF files with potential channel issues
-    if src.suffix.lower() in {".tif", ".tiff"}:
-        is_valid, error_msg = validate_tiff_file(src)
-        if not is_valid:
-            console.print(f"[yellow]TIFF validation failed for {src.name}: {error_msg}[/]")
-            console.print(f"[blue]Attempting channel splitting for {src.name}[/]")
-
-            # Try to split the TIFF into RGB and alpha
-            temp_dir = dst.parent / "temp_split"
-            success, split_files, split_error = split_tiff_channels(src, temp_dir)
-
-            if success and len(split_files) >= 2:
-                rgb_path, alpha_path = split_files[:2]
-
-                # Convert RGB to WebP first
-                rgb_dst = dst.parent / f"{dst.stem}_rgb{quality.mode}.webp"
-                rgb_cmd = build_cwebp_cmd(rgb_path, rgb_dst, quality)
-                rgb_code, rgb_pretty = run_subprocess(rgb_cmd)
-
-                if rgb_code != 0:
-                    return False, f"FAIL RGB({rgb_code}) {rgb_pretty}"
-
-                # Convert alpha to WebP
-                alpha_dst = dst.parent / f"{dst.stem}_alpha{quality.mode}.webp"
-                alpha_cmd = build_cwebp_cmd(alpha_path, alpha_dst, quality)
-                alpha_code, alpha_pretty = run_subprocess(alpha_cmd)
-
-                if alpha_code != 0:
-                    return False, f"FAIL Alpha({alpha_code}) {alpha_pretty}"
-
-                # For now, just use the RGB version as the main output
-                # TODO: Implement alpha recombination for WebP
-                import shutil
-                shutil.copy2(rgb_dst, dst)
-
-                # Clean up temp files
-                try:
-                    rgb_path.unlink(missing_ok=True)
-                    alpha_path.unlink(missing_ok=True)
-                    rgb_dst.unlink(missing_ok=True)
-                    alpha_dst.unlink(missing_ok=True)
-                    temp_dir.rmdir()
-                except:
-                    pass
-
-                return True, f"ok {dst.name} (split channels)"
-            else:
-                return False, f"Channel splitting failed: {split_error}"
-
-    # Normal processing for other formats
+    # Normal processing for all formats
     cmd = build_cwebp_cmd(src, dst, quality)
     code, pretty = run_subprocess(cmd)
     if code != 0:
