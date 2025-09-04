@@ -23,3 +23,6 @@ Use Markdown only where semantically appropriate (headings, lists, `inline code`
 - **Complexity:** Favor clarity over cleverness. Keep cyclomatic complexity low; extract helpers when branches multiply.
 - **Dependencies:** Minimize external libs. If adding one, justify in **Notes**.
 - **Performance:** Be reasonable; when relevant, mention complexity in **Notes**.
+
+# Project
+- Run using UV
