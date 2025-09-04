@@ -578,14 +578,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
     require_cwebp = bool(args.individual_frames)
-     if args.check_tools:
-         ok, probs = check_tools(require_cwebp=require_cwebp)
-         if ok:
-             console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
-             return 0
-         for p in probs:
-             console.print(f"[bold red]Missing:[/] {p}")
-         return 1
+    if args.check_tools:
+        ok, probs = check_tools(require_cwebp=require_cwebp)
+        if ok:
+            console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
+            return 0
+        for p in probs:
+            console.print(f"[bold red]Missing:[/] {p}")
+        return 1
 
     quality = Quality.from_name(args.quality)
     workers = pick_worker_count(args.max_workers, args.sequential)
@@ -593,17 +593,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     base_path = args.base_path
     output_dir = args.output_dir
 
-     safe, reason = is_safe_output_location(base_path, output_dir)
-     if not safe:
-         console.print(f"[bold red]Unsafe output location:[/] {reason}")
-         console.print("No files were written.")
-         return 1
+    safe, reason = is_safe_output_location(base_path, output_dir)
+    if not safe:
+        console.print(f"[bold red]Unsafe output location:[/] {reason}")
+        console.print("No files were written.")
+        return 1
 
-     tools_ok, probs = check_tools(require_cwebp=require_cwebp)
-     if not tools_ok:
-         for p in probs:
-             console.print(f"[bold red]Missing:[/] {p}")
-         return 1
+    tools_ok, probs = check_tools(require_cwebp=require_cwebp)
+    if not tools_ok:
+        for p in probs:
+            console.print(f"[bold red]Missing:[/] {p}")
+        return 1
 
     print_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
 
@@ -683,17 +683,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             console.print(f"    size: [green]{size:,}[/] bytes")
                     except futures.TimeoutError:
                         failures += 1
-                         fut.cancel()
-                         console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}")
-                     except Exception as ex:
-                         failures += 1
-                         console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
+                        fut.cancel()
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}")
+                    except Exception as ex:
+                        failures += 1
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
 
     except GracefulExit:
         # Message already printed by signal handler
         pass
-     except KeyboardInterrupt:
-         console.print("Interrupted.")
+    except KeyboardInterrupt:
+        console.print("Interrupted.")
     finally:
         pass
 
