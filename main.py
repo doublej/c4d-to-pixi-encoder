@@ -39,7 +39,6 @@ console = Console()
 
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".exr", ".dpx"}
 
-DEFAULT_OUTPUT = Path("outputs") / "webp_renders"
 INDIVIDUAL_SUBDIR = Path("individual_frames")
 
 MAX_WORKER_CAP = 8
@@ -51,33 +50,35 @@ DEFAULT_TIMEOUT_SEC = 300
 
 @dataclass(frozen=True)
 class Quality:
-    """Encoding parameters for WebP."""
+    """Encoding parameters for WebP or AVIF."""
     mode: str  # "high" | "medium" | "low" | "lossless"
     ffmpeg_args: List[str]
-    cwebp_args: List[str]
 
     @staticmethod
-    def from_name(name: str) -> "Quality":
+    def from_name(name: str, format: str) -> "Quality":
         n = name.lower().strip()
-        if n == "lossless":
-            return Quality(
-                mode="lossless",
-                ffmpeg_args=["-lossless", "1", "-compression_level", "3"],
-                cwebp_args=["-lossless", "-z", "3"],  # fast lossless
-            )
-        mapping = {
-            "high": "90",
-            "medium": "80",
-            "low": "70",
-        }
-        if n not in mapping:
-            raise ValueError(f"Unknown quality preset: {name}")
-        q = mapping[n]
-        return Quality(
-            mode=n,
-            ffmpeg_args=["-quality", q, "-compression_level", "3"],
-            cwebp_args=["-q", q],
-        )
+        if format == "webp":
+            if n == "lossless":
+                return Quality(
+                    mode="lossless",
+                    ffmpeg_args=["-lossless", "1", "-compression_level", "3"],
+                )
+            mapping = {"high": "90", "medium": "80", "low": "70"}
+            if n not in mapping:
+                raise ValueError(f"Unknown quality preset for webp: {name}")
+            q = mapping[n]
+            return Quality(mode=n, ffmpeg_args=["-quality", q, "-compression_level", "3"])
+        elif format == "avif":
+            # CRF values for SVT-AV1. Lower is better quality.
+            if n == "lossless":
+                return Quality(mode="lossless", ffmpeg_args=["-crf", "0", "-preset", "10"])
+            mapping = {"high": "23", "medium": "30", "low": "40"}
+            if n not in mapping:
+                raise ValueError(f"Unknown quality preset for avif: {name}")
+            crf = mapping[n]
+            return Quality(mode=n, ffmpeg_args=["-crf", crf, "-preset", "8"])
+        else:
+            raise ValueError(f"Unknown format for quality settings: {format}")
 
 
 @dataclass
@@ -105,8 +106,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-p", "--base-path", type=Path, default=Path("."), help="Base path to scan")
-    p.add_argument("-o", "--output-dir", type=Path, default=DEFAULT_OUTPUT, help="Output directory")
+    p.add_argument("-o", "--output-dir", type=Path, help="Output directory. Defaults to 'outputs/{format}_renders'")
     p.add_argument("-q", "--quality", choices=["high", "medium", "low", "lossless"], default="high", help="Quality preset")
+    p.add_argument("--format", choices=["webp", "avif"], default="webp", help="Output format")
     p.add_argument("-i", "--individual-frames", action="store_true", help="Export individual WebP per frame instead of animated")
     p.add_argument("-w", "--max-workers", type=int, help="Max parallel workers (capped at 8)")
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
@@ -130,13 +132,11 @@ def pick_worker_count(requested: Optional[int], sequential: bool) -> int:
     return max(1, min(requested, MAX_WORKER_CAP))
 
 
-def check_tools(require_cwebp: bool) -> Tuple[bool, List[str]]:
+def check_tools() -> Tuple[bool, List[str]]:
     """Verify required external tools are available."""
     problems: List[str] = []
     if which("ffmpeg") is None:
         problems.append("ffmpeg not found in PATH")
-    if require_cwebp and which("cwebp") is None:
-        problems.append("cwebp not found in PATH (required for --individual-frames)")
     return (len(problems) == 0, problems)
 
 
@@ -311,25 +311,25 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
 # Output path resolution
 # ------------------------------
 
-def animated_output_path(output_root: Path, seq: SequenceInfo) -> Path:
+def animated_output_path(output_root: Path, seq: SequenceInfo, format: str) -> Path:
     """
-    Place one .webp per sequence under output_root mirroring the relative directory.
+    Place one output file per sequence under output_root mirroring the relative directory.
     """
     # e.g., outputs/webp_renders/<rel_dir>/<prefix_or_dirname>_<ext>.webp
     rel_target_dir = output_root / seq.rel_dir
     base_name_str = seq.prefix.strip() or seq.dir_path.name
     base_name = base_name_str.rstrip("._-")
-    basename = f"{base_name}_{seq.ext.lstrip('.')}.webp"
+    basename = f"{base_name}_{seq.ext.lstrip('.')}.{format}"
     return rel_target_dir / basename
 
 
-def individual_output_path(output_root: Path, seq: SequenceInfo, frame: Path) -> Path:
+def individual_output_path(output_root: Path, seq: SequenceInfo, frame: Path, format: str) -> Path:
     """
     Place per-frame outputs under:
-      output_root/individual_frames/<rel_dir>/<frame_stem>.webp
+      output_root/individual_frames/<rel_dir>/<frame_stem>.<format>
     """
     rel_dir = output_root / INDIVIDUAL_SUBDIR / seq.rel_dir
-    return rel_dir / f"{frame.stem}.webp"
+    return rel_dir / f"{frame.stem}.{format}"
 
 
 # ------------------------------
@@ -341,8 +341,9 @@ def build_ffmpeg_cmd(
     out_path: Path,
     quality: Quality,
     threads: int,
+    format: str,
 ) -> List[str]:
-    """Create ffmpeg command for animated WebP."""
+    """Create ffmpeg command for an animated image sequence."""
     base = [
         "ffmpeg",
         "-hide_banner",
@@ -354,12 +355,24 @@ def build_ffmpeg_cmd(
         "-an",
         "-vsync", "0",
         "-r", "30",
-        "-c:v", "libwebp",
-        "-loop", "0",
-        "-pix_fmt", "yuva420p",
-        "-threads", str(max(1, threads)),
     ]
-    return base + quality.ffmpeg_args + [str(out_path)]
+    if format == "webp":
+        codec_args = [
+            "-c:v", "libwebp",
+            "-loop", "0",
+            "-pix_fmt", "yuva420p",
+            "-threads", str(max(1, threads)),
+        ]
+    elif format == "avif":
+        codec_args = [
+            "-c:v", "libsvtav1",
+            "-pix_fmt", "yuv420p10le",
+            "-threads", str(max(1, threads)),
+        ]
+    else:
+        raise ValueError(f"Unsupported format for animated encoding: {format}")
+
+    return base + codec_args + quality.ffmpeg_args + [str(out_path)]
 
 
 def write_ffconcat_file(frame_paths: List[Path], target_dir: Path) -> Path:
@@ -397,13 +410,14 @@ def encode_sequence_animated_task(
     out_path: str,
     quality_mode: str,
     threads: int,
+    format: str,
 ) -> Tuple[bool, str, Optional[int]]:
     """
-    Child-process-safe function to encode one sequence to animated WebP.
+    Child-process-safe function to encode one sequence to an animated image.
     Returns (success, message, output_size_bytes|None).
     """
     try:
-        q = Quality.from_name(quality_mode)
+        q = Quality.from_name(quality_mode, format)
         out = Path(out_path)
         out.parent.mkdir(parents=True, exist_ok=True)
 
@@ -414,7 +428,7 @@ def encode_sequence_animated_task(
 
         with tempfile.TemporaryDirectory(prefix="webpseq_") as td:
             list_file = write_ffconcat_file([Path(p) for p in frame_paths], Path(td))
-            cmd = build_ffmpeg_cmd(list_file, out, q, threads)
+            cmd = build_ffmpeg_cmd(list_file, out, q, threads, format)
             code, pretty = run_subprocess(cmd)
             if code != 0:
                 return False, f"ffmpeg failed: {pretty}", None
@@ -429,19 +443,28 @@ def encode_sequence_animated_task(
 # Individual-frames pipeline (thread-level parallelism)
 # ------------------------------
 
-def build_cwebp_cmd(src: Path, dst: Path, quality: Quality) -> List[str]:
-    """Create cwebp command for a single frame."""
+def build_ffmpeg_individual_cmd(src: Path, dst: Path, quality: Quality, format: str) -> List[str]:
+    """Create ffmpeg command for a single frame."""
     dst.parent.mkdir(parents=True, exist_ok=True)
-    base = ["cwebp", "-mt"]
-    # progress is default; avoid -quiet to allow progress reporting
-    if quality.mode == "lossless":
-        args = quality.cwebp_args
+    base = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-i", str(src),
+        "-an",
+    ]
+    if format == "webp":
+        codec_args = ["-c:v", "libwebp", "-pix_fmt", "yuva420p"]
+    elif format == "avif":
+        codec_args = ["-c:v", "libsvtav1", "-pix_fmt", "yuv420p10le", "-still-picture", "1"]
     else:
-        args = quality.cwebp_args
-    return base + args + [src.as_posix(), "-o", dst.as_posix()]
+        raise ValueError(f"Unsupported format for individual encoding: {format}")
+
+    return base + codec_args + quality.ffmpeg_args + [str(dst)]
 
 
-def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]:
+def encode_one_frame(src: Path, dst: Path, quality: Quality, format: str) -> Tuple[bool, str]:
     """Encode one frame, skipping if output exists."""
     if dst.exists():
         return True, f"skip {dst.name}"
@@ -451,7 +474,7 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
     message_suffix = ""
 
     try:
-        # Handle TIFF files with potential channel issues
+        # Handle TIFF files with potential channel issues by converting to a temp PNG
         if src.suffix.lower() in {".tif", ".tiff"}:
             is_valid, reason = validate_tiff_file(src)
             if not is_valid:
@@ -465,8 +488,8 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
                 else:
                     return False, f"FAIL: TIFF processing failed: {split_msg}"
 
-        # Normal processing for other formats, or processed TIFFs
-        cmd = build_cwebp_cmd(source_to_encode, dst, quality)
+        # Encode with ffmpeg
+        cmd = build_ffmpeg_individual_cmd(source_to_encode, dst, quality, format)
         code, pretty = run_subprocess(cmd)
 
         if code != 0:
@@ -479,10 +502,8 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
             try:
                 parent_dir = temp_src_file.parent
                 temp_src_file.unlink()
-                # Try to remove the temp dir if it's empty
                 parent_dir.rmdir()
             except OSError:
-                # Dir not empty, or other issue. Not critical.
                 pass
 
 
@@ -492,6 +513,7 @@ def encode_sequence_individual(
     quality: Quality,
     threads: int,
     timeout_sec: int,
+    format: str,
 ) -> Tuple[bool, str, int]:
     """
     Convert one sequence to individual frames using thread pool.
@@ -500,7 +522,7 @@ def encode_sequence_individual(
     # Build tasks for missing outputs
     tasks: List[Tuple[Path, Path]] = []
     for f in seq.frames:
-        dst = individual_output_path(out_root, seq, f)
+        dst = individual_output_path(out_root, seq, f, format)
         if not dst.exists():
             tasks.append((f, dst))
 
@@ -516,7 +538,7 @@ def encode_sequence_individual(
 
     def work(pair: Tuple[Path, Path]) -> Tuple[bool, str]:
         src, dst = pair
-        return encode_one_frame(src, dst, quality)
+        return encode_one_frame(src, dst, quality, format)
 
     with futures.ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
         futs = [pool.submit(work, t) for t in tasks]
@@ -559,13 +581,14 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
         raise GracefulExit()
     signal.signal(signal.SIGINT, handler)
 
-def create_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: int, mode: str, quality: Quality) -> Panel:
+def create_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: int, mode: str, quality: Quality, format: str) -> Panel:
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column(style="dim")
     table.add_column()
     table.add_row("Source:", str(base_path.resolve()))
     table.add_row("Output:", str(output_dir.resolve()))
     table.add_row("Safety:", safe_msg or "ok")
+    table.add_row("Format:", format.upper())
     table.add_row("Mode:", 'individual-frames' if mode == 'individual' else 'animated')
     table.add_row("Quality:", quality.mode)
     table.add_row("Workers:", f"{workers} (cap {MAX_WORKER_CAP})")
@@ -574,21 +597,20 @@ def create_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
 
-    require_cwebp = bool(args.individual_frames)
     if args.check_tools:
-        ok, probs = check_tools(require_cwebp=require_cwebp)
+        ok, probs = check_tools()
         if ok:
-            console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
+            console.print("[bold green]Tools OK:[/] ffmpeg")
             return 0
         for p in probs:
             console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
-    quality = Quality.from_name(args.quality)
+    quality = Quality.from_name(args.quality, args.format)
     workers = pick_worker_count(args.max_workers, args.sequential)
 
     base_path = args.base_path
-    output_dir = args.output_dir
+    output_dir = args.output_dir or Path("outputs") / f"{args.format}_renders"
 
     safe, reason = is_safe_output_location(base_path, output_dir)
     if not safe:
@@ -596,13 +618,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.print("No files were written.", file=sys.stderr)
         return 1
 
-    tools_ok, probs = check_tools(require_cwebp=require_cwebp)
+    tools_ok, probs = check_tools()
     if not tools_ok:
         for p in probs:
             console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
-    header = create_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
+    header = create_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality, args.format)
 
     t0 = time.time()
     sequences = find_sequences(base_path)
@@ -669,6 +691,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         quality=quality,
                         threads=workers,
                         timeout_sec=DEFAULT_TIMEOUT_SEC,
+                        format=args.format,
                     )
                     produced_total += produced
                     log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
@@ -684,7 +707,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 with futures.ProcessPoolExecutor(max_workers=workers) as pool:
                     fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
                     for i, seq in enumerate(sequences, 1):
-                        out_path = animated_output_path(output_dir, seq)
+                        out_path = animated_output_path(output_dir, seq, args.format)
                         out_path.parent.mkdir(parents=True, exist_ok=True)
                         frame_paths = [p.as_posix() for p in seq.frames]
                         fut = pool.submit(
@@ -693,6 +716,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             out_path.as_posix(),
                             quality.mode,
                             max(1, workers),
+                            args.format,
                         )
                         fut_map[fut] = (i, seq, out_path)
 
