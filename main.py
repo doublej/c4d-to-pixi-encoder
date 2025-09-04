@@ -69,14 +69,15 @@ class Quality:
             q = mapping[n]
             return Quality(mode=n, ffmpeg_args=["-quality", q, "-compression_level", "3"])
         elif format == "avif":
-            # CRF values for SVT-AV1. Lower is better quality.
+            # Use libaom-av1 settings; include -b:v 0 for CQ mode and -cpu-used for speed.
+            # Lower CRF = better quality.
             if n == "lossless":
-                return Quality(mode="lossless", ffmpeg_args=["-crf", "0", "-preset", "10"])
+                return Quality(mode="lossless", ffmpeg_args=["-crf", "0", "-b:v", "0", "-cpu-used", "6"])
             mapping = {"high": "23", "medium": "30", "low": "40"}
             if n not in mapping:
                 raise ValueError(f"Unknown quality preset for avif: {name}")
             crf = mapping[n]
-            return Quality(mode=n, ffmpeg_args=["-crf", crf, "-preset", "8"])
+            return Quality(mode=n, ffmpeg_args=["-crf", crf, "-b:v", "0", "-cpu-used", "6"])
         else:
             raise ValueError(f"Unknown format for quality settings: {format}")
 
@@ -110,6 +111,16 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("-q", "--quality", choices=["high", "medium", "low", "lossless"], default="high", help="Quality preset")
     p.add_argument("--format", choices=["webp", "avif"], default="webp", help="Output format")
     p.add_argument("-i", "--individual-frames", action="store_true", help="Export individual WebP per frame instead of animated")
+    p.add_argument(
+        "--pad-digits",
+        type=int,
+        default=None,
+        help=(
+            "Zero-padding width for per-frame filenames. "
+            "When set, per-sequence numbering starts at 1 and outputs are named 00001, 00002, ... in each folder. "
+            "When unset, the input filename is used."
+        ),
+    )
     p.add_argument("-w", "--max-workers", type=int, help="Max parallel workers (capped at 8)")
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
     p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
@@ -323,13 +334,24 @@ def animated_output_path(output_root: Path, seq: SequenceInfo, format: str) -> P
     return rel_target_dir / basename
 
 
-def individual_output_path(output_root: Path, seq: SequenceInfo, frame: Path, format: str) -> Path:
+def individual_output_path(
+    output_root: Path,
+    seq: SequenceInfo,
+    frame: Path,
+    format: str,
+    frame_index: Optional[int] = None,
+    pad_digits: Optional[int] = None,
+) -> Path:
     """
     Place per-frame outputs under:
       output_root/individual_frames/<rel_dir>/<frame_stem>.<format>
     """
     rel_dir = output_root / INDIVIDUAL_SUBDIR / seq.rel_dir
-    return rel_dir / f"{frame.stem}.{format}"
+    if pad_digits and frame_index is not None:
+        name = f"{frame_index:0{pad_digits}d}.{format}"
+    else:
+        name = f"{frame.stem}.{format}"
+    return rel_dir / name
 
 
 # ------------------------------
@@ -360,13 +382,18 @@ def build_ffmpeg_cmd(
         codec_args = [
             "-c:v", "libwebp",
             "-loop", "0",
+            # Force RGBA upstream so alpha is preserved through filters
+            "-vf", "format=rgba",
             "-pix_fmt", "yuva420p",
             "-threads", str(max(1, threads)),
         ]
     elif format == "avif":
         codec_args = [
-            "-c:v", "libsvtav1",
-            "-pix_fmt", "yuva420p",
+            "-c:v", "libaom-av1",
+            # Ensure alpha channel flows; convert to RGBA before encode
+            "-vf", "format=rgba",
+            # Use 4:4:4 with alpha to avoid subsampling-related alpha drops
+            "-pix_fmt", "yuva444p",
             "-threads", str(max(1, threads)),
         ]
     else:
@@ -455,9 +482,10 @@ def build_ffmpeg_individual_cmd(src: Path, dst: Path, quality: Quality, format: 
         "-an",
     ]
     if format == "webp":
-        codec_args = ["-c:v", "libwebp", "-pix_fmt", "yuva420p"]
+        codec_args = ["-vf", "format=rgba", "-c:v", "libwebp", "-pix_fmt", "yuva420p"]
     elif format == "avif":
-        codec_args = ["-c:v", "libsvtav1", "-pix_fmt", "yuva420p", "-still-picture", "1"]
+        # Force RGBA input and encode with alpha-capable pixel format
+        codec_args = ["-vf", "format=rgba", "-c:v", "libaom-av1", "-pix_fmt", "yuva444p", "-still-picture", "1"]
     else:
         raise ValueError(f"Unsupported format for individual encoding: {format}")
 
@@ -514,6 +542,7 @@ def encode_sequence_individual(
     threads: int,
     timeout_sec: int,
     format: str,
+    pad_digits: Optional[int] = None,
 ) -> Tuple[bool, str, int]:
     """
     Convert one sequence to individual frames using thread pool.
@@ -521,8 +550,8 @@ def encode_sequence_individual(
     """
     # Build tasks for missing outputs
     tasks: List[Tuple[Path, Path]] = []
-    for f in seq.frames:
-        dst = individual_output_path(out_root, seq, f, format)
+    for idx, f in enumerate(seq.frames, start=1):
+        dst = individual_output_path(out_root, seq, f, format, frame_index=idx, pad_digits=pad_digits)
         if not dst.exists():
             tasks.append((f, dst))
 
@@ -692,6 +721,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         threads=workers,
                         timeout_sec=DEFAULT_TIMEOUT_SEC,
                         format=args.format,
+                        pad_digits=args.pad_digits,
                     )
                     produced_total += produced
                     log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
