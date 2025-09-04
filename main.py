@@ -204,16 +204,18 @@ def parse_stem(stem: str) -> Optional[Tuple[str, int]]:
 
 
 
-def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
+def split_tiff_to_rgba_files(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
     """
-    Split a 4-channel TIFF file into RGB and alpha components using OpenCV.
-    Returns (success, [rgb_path, alpha_path], error_message).
+    Split a 4-channel TIFF file into R, G, B, and A components using OpenCV.
+    Returns (success, [r_path, g_path, b_path, a_path], error_message).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = file_path.stem
 
-    rgb_path = output_dir / f"{stem}_rgb.png"
-    alpha_path = output_dir / f"{stem}_alpha.png"
+    r_path = output_dir / f"{stem}_r.png"
+    g_path = output_dir / f"{stem}_g.png"
+    b_path = output_dir / f"{stem}_b.png"
+    a_path = output_dir / f"{stem}_a.png"
 
     try:
         # Read the 4-channel TIFF image
@@ -222,22 +224,66 @@ def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[P
             return False, [], "OpenCV could not read the image."
 
         if img.shape[2] != 4:
-            return False, [], f"Image does not have 4 channels, but {img.shape[2]}."
+            return False, [], f"Image does not have 4 channels, but {img.shape[2]}. "
 
-        # Split the channels
+        # Split the channels (OpenCV reads as BGRA)
         b, g, r, a = cv2.split(img)
-        rgb = cv2.merge((r, g, b))
-        
-        # Save the RGB and alpha images
-        cv2.imwrite(str(rgb_path), rgb)
-        cv2.imwrite(str(alpha_path), a)
 
-        return True, [rgb_path, alpha_path], ""
+        # Save each channel as a separate file
+        cv2.imwrite(str(r_path), r)
+        cv2.imwrite(str(g_path), g)
+        cv2.imwrite(str(b_path), b)
+        cv2.imwrite(str(a_path), a)
+
+        return True, [r_path, g_path, b_path, a_path], ""
     except Exception as e:
         return False, [], f"Exception during channel splitting: {e}"
 
 
+def combine_rgba_files_to_webp(
+    r_path: Path,
+    g_path: Path,
+    b_path: Path,
+    a_path: Path,
+    dst_path: Path,
+    quality: Quality,
+) -> Tuple[bool, str]:
+    """
+    Combines R, G, B, and A image files into a single WebP file.
+    """
+    try:
+        # Read the individual channels
+        r = cv2.imread(str(r_path), cv2.IMREAD_GRAYSCALE)
+        g = cv2.imread(str(g_path), cv2.IMREAD_GRAYSCALE)
+        b = cv2.imread(str(b_path), cv2.IMREAD_GRAYSCALE)
+        a = cv2.imread(str(a_path), cv2.IMREAD_GRAYSCALE)
 
+        if any(c is None for c in [r, g, b, a]):
+            return False, "Failed to read one or more channel files."
+
+        # Merge the channels into a BGRA image (OpenCV's expectation)
+        rgba = cv2.merge((b, g, r, a))
+
+        # Create a temporary path for the intermediate PNG
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_f:
+            temp_png_path = Path(temp_f.name)
+
+        # Save the merged RGBA image as a PNG
+        cv2.imwrite(str(temp_png_path), rgba)
+
+        # Build and run the cwebp command
+        cmd = build_cwebp_cmd(temp_png_path, dst_path, quality)
+        code, pretty = run_subprocess(cmd)
+
+        # Clean up the temporary PNG file
+        temp_png_path.unlink(missing_ok=True)
+
+        if code != 0:
+            return False, f"FAIL cwebp({code}) {pretty}"
+
+        return True, f"ok {dst_path.name} (recombined channels)"
+    except Exception as e:
+        return False, f"Exception during channel recombination: {e}"
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
@@ -432,54 +478,30 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
 
     # Handle TIFF files with potential channel issues
     if src.suffix.lower() in {".tif", ".tiff"}:
+        temp_dir = dst.parent / "temp_split"
         try:
-            img = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
-            if img is not None and img.shape[2] == 4:
-                console.print(f"[blue]Splitting 4-channel TIFF: {src.name}[/]")
-                
-                # Try to split the TIFF into RGB and alpha
-                temp_dir = dst.parent / "temp_split"
-                success, split_files, split_error = split_tiff_channels(src, temp_dir)
+            # Split the TIFF into R, G, B, A channels
+            success, split_files, split_error = split_tiff_to_rgba_files(src, temp_dir)
 
-                if success and len(split_files) >= 2:
-                    rgb_path, alpha_path = split_files[:2]
+            if not success:
+                return False, f"Channel splitting failed: {split_error}"
 
-                    # Convert RGB to WebP first
-                    rgb_dst = dst.parent / f"{dst.stem}_rgb{quality.mode}.webp"
-                    rgb_cmd = build_cwebp_cmd(rgb_path, rgb_dst, quality)
-                    rgb_code, rgb_pretty = run_subprocess(rgb_cmd)
+            r_path, g_path, b_path, a_path = split_files
 
-                    if rgb_code != 0:
-                        return False, f"FAIL RGB({rgb_code}) {rgb_pretty}"
+            # Combine the channels into a final WebP image
+            success, combine_msg = combine_rgba_files_to_webp(
+                r_path, g_path, b_path, a_path, dst, quality
+            )
 
-                    # Convert alpha to WebP
-                    alpha_dst = dst.parent / f"{dst.stem}_alpha{quality.mode}.webp"
-                    alpha_cmd = build_cwebp_cmd(alpha_path, alpha_dst, quality)
-                    alpha_code, alpha_pretty = run_subprocess(alpha_cmd)
+            return success, combine_msg
 
-                    if alpha_code != 0:
-                        return False, f"FAIL Alpha({alpha_code}) {alpha_pretty}"
-
-                    # For now, just use the RGB version as the main output
-                    # TODO: Implement alpha recombination for WebP
-                    import shutil
-                    shutil.copy2(rgb_dst, dst)
-
-                    # Clean up temp files
-                    try:
-                        rgb_path.unlink(missing_ok=True)
-                        alpha_path.unlink(missing_ok=True)
-                        rgb_dst.unlink(missing_ok=True)
-                        alpha_dst.unlink(missing_ok=True)
-                        temp_dir.rmdir()
-                    except:
-                        pass
-
-                    return True, f"ok {dst.name} (split channels)"
-                else:
-                    return False, f"Channel splitting failed: {split_error}"
         except Exception as e:
-            console.print(f"[yellow]Could not process TIFF {src.name} with OpenCV: {e}[/]")
+            return False, f"Error processing TIFF {src.name}: {e}"
+        finally:
+            # Clean up temporary channel files
+            import shutil
+            if temp_dir.exists():
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Normal processing for other formats
     cmd = build_cwebp_cmd(src, dst, quality)
