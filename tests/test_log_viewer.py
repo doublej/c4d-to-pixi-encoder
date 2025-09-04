@@ -9,8 +9,9 @@ import tempfile
 # Add parent directory to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from log_viewer import ScrollableLogViewer
+from log_viewer import ScrollableLogViewer, StderrInterceptor
 from rich.text import Text
+import io
 
 
 def test_log_viewer_basic_operations():
@@ -102,3 +103,28 @@ def test_log_viewer_panel_generation():
     viewer.scroll_down(1)
     panel = viewer.get_panel(title="Test Log")
     assert "of 5]" in panel.title
+
+
+def test_stderr_interceptor():
+    """Test stderr interceptor captures output correctly."""
+    viewer = ScrollableLogViewer(max_visible_lines=5, max_history=100)
+    original_stderr = io.StringIO()
+    
+    interceptor = StderrInterceptor(viewer, original_stderr)
+    
+    # Write some test output
+    interceptor.write("[ffmpeg] test command\n")
+    interceptor.write("Regular output\n")
+    interceptor.write("Partial line")
+    interceptor.flush()
+    
+    # Check logs were captured
+    assert len(viewer.logs) == 3  # ffmpeg line, regular line, partial line
+    assert viewer.logs[0].plain == "[ffmpeg] test command"
+    assert viewer.logs[1].plain == "Regular output"
+    assert viewer.logs[2].plain == "Partial line"
+    
+    # Check original stderr got the output
+    original_output = original_stderr.getvalue()
+    assert "[ffmpeg] test command" in original_output
+    assert "Regular output" in original_output

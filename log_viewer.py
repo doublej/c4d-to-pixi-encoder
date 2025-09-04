@@ -7,10 +7,12 @@ and allows scrolling through history even when new entries are added.
 
 from __future__ import annotations
 
+import io
+import sys
 from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, List, Optional, Union
+from typing import Deque, List, Optional, Union, TextIO
 
 from rich.console import Console, RenderableType
 from rich.panel import Panel
@@ -169,3 +171,56 @@ class ScrollableLogViewer:
         """Clear all log entries."""
         self.logs.clear()
         self.scroll_offset = 0
+
+
+class StderrInterceptor(io.TextIOBase):
+    """Intercept stderr output and route to log viewer.
+    
+    This class wraps stderr and sends any output to both the original
+    stderr and the log viewer.
+    """
+    
+    def __init__(self, log_viewer: ScrollableLogViewer, original_stderr: TextIO):
+        self.log_viewer = log_viewer
+        self.original_stderr = original_stderr
+        self.buffer = ""
+    
+    def write(self, s: str) -> int:
+        """Write text to both stderr and log viewer."""
+        if not s:
+            return 0
+        
+        # Write to original stderr
+        self.original_stderr.write(s)
+        self.original_stderr.flush()
+        
+        # Buffer and process for log viewer
+        self.buffer += s
+        
+        # Process complete lines
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+            if line.strip():
+                # Check for special formatting
+                if '[ffmpeg]' in line:
+                    self.log_viewer.add_log(line, style="dim cyan")
+                else:
+                    self.log_viewer.add_log(line, style="dim")
+        
+        return len(s)
+    
+    def flush(self) -> None:
+        """Flush both streams."""
+        self.original_stderr.flush()
+        # Flush any remaining buffer content
+        if self.buffer and self.buffer.strip():
+            self.log_viewer.add_log(self.buffer, style="dim")
+            self.buffer = ""
+    
+    def fileno(self) -> int:
+        """Return file descriptor of original stderr."""
+        return self.original_stderr.fileno()
+    
+    def isatty(self) -> bool:
+        """Return whether original stderr is a TTY."""
+        return self.original_stderr.isatty()

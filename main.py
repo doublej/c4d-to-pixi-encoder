@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from persistent_output import install_persistent_console
-from log_viewer import ScrollableLogViewer
+from log_viewer import ScrollableLogViewer, StderrInterceptor
 
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -861,6 +861,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     layout["footer"].update(get_footer())
+    
+    # Install stderr interceptor to capture subprocess output
+    original_stderr = sys.stderr
+    stderr_interceptor = StderrInterceptor(log_viewer, original_stderr)
+    sys.stderr = stderr_interceptor
 
     try:
         # Use main screen buffer so all logs remain visible in the terminal
@@ -981,9 +986,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # Message already printed by signal handler
         pass
     except KeyboardInterrupt:
-        console.print("Interrupted.", file=sys.stderr)
+        console.print("Interrupted.", file=original_stderr)
     finally:
-        pass
+        # Restore original stderr
+        sys.stderr = original_stderr
 
     total_time = time.time() - t0
     total_sequences = len(sequences)
