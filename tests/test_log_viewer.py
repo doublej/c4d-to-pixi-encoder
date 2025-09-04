@@ -27,9 +27,10 @@ def test_log_viewer_basic_operations():
     # Check we have 5 logs
     assert len(viewer.logs) == 5
     
-    # Check visible logs (should show last 3)
+    # Check visible logs (should always be 3 due to padding)
     visible = viewer.get_visible_logs()
     assert len(visible) == 3
+    # The last 3 actual logs should be visible (scrolled to bottom by default)
     assert visible[0].plain == "Log entry 3"
     assert visible[1].plain == "Log entry 4"
     assert visible[2].plain == "Log entry 5"

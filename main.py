@@ -830,11 +830,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     
     # Add initial sequences table to log
-    for line in str(sequences_table).split('\n'):
+    from rich.console import Console
+    temp_console = Console(file=None, force_terminal=False)
+    with temp_console.capture() as capture:
+        temp_console.print(sequences_table)
+    table_output = capture.get()
+    for line in table_output.split('\n'):
         if line.strip():
             log_viewer.add_log(line)
     
-    layout["main"].update(log_viewer.get_panel(title="Log History"))
+    # Create a renderable that always shows the current log panel
+    class LogPanel:
+        def __rich__(self):
+            return log_viewer.get_panel(title="Log History")
+    
+    layout["main"].update(LogPanel())
 
     def get_footer() -> Panel:
         total = successes + failures
@@ -854,7 +864,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         # Use main screen buffer so all logs remain visible in the terminal
-        with Live(layout, screen=False, redirect_stderr=False, refresh_per_second=4) as live:
+        with Live(layout, screen=False, redirect_stderr=False, refresh_per_second=2) as live:
             # Start background listener for pause/quit controls
             _ = start_controls_listener(pause_ev, stop_ev, log_viewer)
             if config.run_mode is RunMode.INDIVIDUAL:
@@ -871,13 +881,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
                     display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
                     log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)")
-                    layout["main"].update(log_viewer.get_panel(title="Log History"))
 
                     ok, msg, produced = encode_sequence_individual(
                             seq=seq, out_root=config.output_dir, quality=config.quality, threads=config.workers, timeout_sec=config.timeout_sec, fmt=config.format, pad_digits=config.pad_digits, )
                     produced_total += produced
                     log_viewer.add_log(f"    -> {msg}", style="green" if ok else "red")
-                    layout["main"].update(log_viewer.get_panel(title="Log History"))
 
                     if ok:
                         successes += 1
@@ -967,7 +975,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                             failures += 1
                             log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", style="red")
                         finally:
-                            layout["main"].update(log_viewer.get_panel(title="Log History"))
                             layout["footer"].update(get_footer())
 
     except GracefulExit:

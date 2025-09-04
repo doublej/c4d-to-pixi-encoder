@@ -99,12 +99,19 @@ class ScrollableLogViewer:
             List of Text objects that should be displayed
         """
         if not self.logs:
-            return [Text("No logs yet...", style="dim")]
+            # Return empty lines to maintain stable height
+            return [Text("") for _ in range(self.max_visible_lines)]
         
         start_idx = self.scroll_offset
         end_idx = min(start_idx + self.max_visible_lines, len(self.logs))
         
-        return list(self.logs)[start_idx:end_idx]
+        visible = list(self.logs)[start_idx:end_idx]
+        
+        # Pad with empty lines to maintain consistent height
+        while len(visible) < self.max_visible_lines:
+            visible.append(Text(""))
+        
+        return visible
     
     def get_panel(self, title: str = "Log History") -> Panel:
         """Get a Rich Panel containing the visible logs.
