@@ -515,22 +515,124 @@ def encode_sequence_individual(seq: SequenceInfo, out_root: Path, quality: Quali
 
 def main() -> int:
     """Main entry point."""
-    parser = argparse.ArgumentParser(description="Convert numeric frame sequences to WebP/AVIF.")
-    parser.add_argument("input_dirs", nargs="+", type=Path, help="Input directory/directories to scan for sequences")
-    parser.add_argument("-o", "--output", type=Path, default=Path("output"), help="Output directory (default: output)")
-    parser.add_argument("-f", "--format", choices=["webp", "avif"], default="webp", help="Output format (default: webp)")
-    parser.add_argument("-q", "--quality", choices=["low", "mid", "high", "max", "webp_lossless"], default="mid", help="Quality preset (default: mid)")
-    parser.add_argument("-m", "--mode", choices=["animated", "individual"], default="animated", help="animated = one animated image per sequence, individual = separate images")
-    parser.add_argument("-j", "--jobs", type=int, default=4, help=f"Worker threads (default: 4, max: {MAX_WORKER_CAP})")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SEC, help=f"Timeout per sequence in seconds (default: {DEFAULT_TIMEOUT_SEC})")
-    parser.add_argument("--exclude", nargs="*", type=Path, help="Directories to exclude from scan")
-    parser.add_argument("--pad-digits", type=int, help="Pad output frame numbers to N digits (e.g., 3 -> 001)")
-    parser.add_argument("--auto-crop", action="store_true", help="Auto-crop AVIF frames to 256x256 based on alpha edges")
+    parser = argparse.ArgumentParser(
+        prog="webpseq",
+        description="Convert numeric frame sequences to WebP/AVIF.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    # Required positional OR -p for base path (for backward compatibility)
+    parser.add_argument(
+        "input_dirs", 
+        nargs="*",  # Made optional to support -p
+        type=Path, 
+        help="Input directory/directories to scan for sequences"
+    )
+    parser.add_argument(
+        "-p", "--base-path",
+        type=Path,
+        default=Path("."),
+        help="Base path to scan (alternative to positional argument)"
+    )
+    
+    # Output directory
+    parser.add_argument(
+        "-o", "--output", "--output-dir",
+        type=Path,
+        default=Path("output"),
+        help="Output directory"
+    )
+    
+    # Format
+    parser.add_argument(
+        "-f", "--format",
+        choices=["webp", "avif"],
+        default="webp",
+        help="Output format"
+    )
+    
+    # Quality
+    parser.add_argument(
+        "-q", "--quality",
+        choices=["low", "medium", "mid", "high", "max", "lossless", "webp_lossless"],
+        default="high",
+        help="Quality preset"
+    )
+    
+    # Mode - support both -m and -i flags
+    parser.add_argument(
+        "-m", "--mode",
+        choices=["animated", "individual"],
+        default="animated",
+        help="animated = one animated image per sequence, individual = separate images"
+    )
+    parser.add_argument(
+        "-i", "--individual-frames",
+        action="store_true",
+        help="Export individual files per frame instead of animated (same as -m individual)"
+    )
+    
+    # Workers
+    parser.add_argument(
+        "-j", "--jobs", "-w", "--max-workers",
+        type=int,
+        default=4,
+        dest="jobs",
+        help=f"Worker threads (max: {MAX_WORKER_CAP})"
+    )
+    
+    # Other options
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_TIMEOUT_SEC,
+        help=f"Timeout per sequence in seconds"
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="*",
+        type=Path,
+        help="Directories to exclude from scan"
+    )
+    parser.add_argument(
+        "--pad-digits",
+        type=int,
+        help="Pad output frame numbers to N digits (e.g., 3 -> 001)"
+    )
+    parser.add_argument(
+        "--auto-crop",
+        action="store_true",
+        help="Auto-crop AVIF frames to 256x256 based on alpha edges"
+    )
+    parser.add_argument(
+        "-s", "--sequential",
+        action="store_true",
+        help="Force sequential processing (workers=1)"
+    )
 
     args = parser.parse_args()
+    
+    # Handle backward compatibility
+    if not args.input_dirs:
+        args.input_dirs = [args.base_path]
+    
+    # Handle quality name mapping
+    if args.quality == "medium":
+        args.quality = "mid"
+    elif args.quality == "lossless":
+        args.quality = "webp_lossless"
+    
+    # Handle individual frames flag
+    if args.individual_frames:
+        args.mode = "individual"
+    
+    # Handle sequential flag
+    if args.sequential:
+        args.jobs = 1
 
     # Setup logger
-    log_file = args.output / "processing.log"
+    output_dir = args.output if hasattr(args, 'output') else args.output_dir
+    log_file = output_dir / "processing.log"
     logger = SimpleLogger(log_file)
     
     logger.section("WEBPSEQ CONVERTER")
@@ -550,7 +652,7 @@ def main() -> int:
     
     config = Config(
         input_dirs=args.input_dirs,
-        output_dir=args.output,
+        output_dir=output_dir,
         format=fmt,
         quality=quality,
         run_mode=mode,
