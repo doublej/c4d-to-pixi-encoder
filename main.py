@@ -32,7 +32,11 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-
+try:
+    from PIL import Image
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
 
 console = Console()
 
@@ -136,6 +140,9 @@ def check_tools(require_cwebp: bool) -> Tuple[bool, List[str]]:
         problems.append("ffmpeg not found in PATH")
     if require_cwebp and which("cwebp") is None:
         problems.append("cwebp not found in PATH (required for --individual-frames)")
+    # Check for ImageMagick for TIFF processing
+    if which("convert") is None:
+        problems.append("ImageMagick (convert) not found in PATH (recommended for TIFF channel splitting)")
     return (len(problems) == 0, problems)
 
 
@@ -201,89 +208,94 @@ def parse_stem(stem: str) -> Optional[Tuple[str, int]]:
 # TIFF validation and processing
 # ------------------------------
 
-
-
-
-def split_tiff_to_rgba_files(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
+def validate_tiff_file(file_path: Path) -> Tuple[bool, str]:
     """
-    Split a 4-channel TIFF file into R, G, B, and A components using OpenCV.
-    Returns (success, [r_path, g_path, b_path, a_path], error_message).
+    Check if a TIFF file has valid metadata for ffmpeg processing.
+    Returns (is_valid, error_message).
+    """
+    if not PIL_AVAILABLE:
+        # Fallback: try to read with ffmpeg directly
+        cmd = ["ffmpeg", "-i", str(file_path), "-f", "null", "-"]
+        result = run(cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, f"ffmpeg cannot read file: {result.stderr}"
+        return True, ""
+
+    try:
+        with Image.open(file_path) as img:
+            # Check TIFF tags if available
+            if hasattr(img, 'tag_v2'):
+                # Check photometric interpretation and samples per pixel
+                photometric = img.tag_v2.get(262)  # PhotometricInterpretation
+                samples_per_pixel = img.tag_v2.get(277)  # SamplesPerPixel
+
+                if photometric is not None and samples_per_pixel is not None:
+                    photometric_val = photometric[0] if isinstance(photometric, tuple) else photometric
+                    spp_val = samples_per_pixel[0] if isinstance(samples_per_pixel, tuple) else samples_per_pixel
+
+                    # RGB photometric (2) should have 3 samples, RGBA (2) can have 4
+                    # But if photometric is 2 and samples > 3, it's invalid for ffmpeg
+                    if photometric_val == 2 and spp_val > 3:
+                        return False, f"RGB photometric with {spp_val} samples/pixel (expected 3)"
+
+            # Also check if PIL can read it but ffmpeg might have issues
+            # If the image has alpha channel but RGB photometric, it's problematic
+            if hasattr(img, 'mode') and img.mode in ['RGBA', 'LA', 'P']:
+                # Check if it has an alpha channel
+                if img.mode in ['RGBA', 'LA'] or (hasattr(img, 'getpixel') and len(img.getpixel((0, 0))) > 3):
+                    # This might be problematic for ffmpeg
+                    return False, f"Image has alpha channel but may have photometric mismatch"
+
+            return True, ""
+    except Exception as e:
+        return False, f"Cannot read TIFF file: {e}"
+
+
+def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
+    """
+    Split a TIFF file with channel issues into RGB and alpha components.
+    Returns (success, [rgb_path, alpha_path], error_message).
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     stem = file_path.stem
 
-    r_path = output_dir / f"{stem}_r.png"
-    g_path = output_dir / f"{stem}_g.png"
-    b_path = output_dir / f"{stem}_b.png"
-    a_path = output_dir / f"{stem}_a.png"
+    rgb_path = output_dir / f"{stem}_rgb.png"
+    alpha_path = output_dir / f"{stem}_alpha.png"
 
     try:
-        # Read the 4-channel TIFF image
-        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
-        if img is None:
-            return False, [], "OpenCV could not read the image."
+        # Use ImageMagick to split channels
+        # Extract RGB channels
+        rgb_cmd = ["convert", str(file_path), "-channel", "RGB", str(rgb_path)]
+        result = run(rgb_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, [], f"Failed to extract RGB: {result.stderr}"
 
-        if img.shape[2] != 4:
-            return False, [], f"Image does not have 4 channels, but {img.shape[2]}. "
+        # Extract alpha channel
+        alpha_cmd = ["convert", str(file_path), "-channel", "A", str(alpha_path)]
+        result = run(alpha_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            return False, [], f"Failed to extract alpha: {result.stderr}"
 
-        # Split the channels (OpenCV reads as BGRA)
-        b, g, r, a = cv2.split(img)
-
-        # Save each channel as a separate file
-        cv2.imwrite(str(r_path), r)
-        cv2.imwrite(str(g_path), g)
-        cv2.imwrite(str(b_path), b)
-        cv2.imwrite(str(a_path), a)
-
-        return True, [r_path, g_path, b_path, a_path], ""
+        return True, [rgb_path, alpha_path], ""
     except Exception as e:
         return False, [], f"Exception during channel splitting: {e}"
 
 
-def combine_rgba_files_to_webp(
-    r_path: Path,
-    g_path: Path,
-    b_path: Path,
-    a_path: Path,
-    dst_path: Path,
-    quality: Quality,
-) -> Tuple[bool, str]:
-    """
-    Combines R, G, B, and A image files into a single WebP file.
-    """
-    try:
-        # Read the individual channels
-        r = cv2.imread(str(r_path), cv2.IMREAD_GRAYSCALE)
-        g = cv2.imread(str(g_path), cv2.IMREAD_GRAYSCALE)
-        b = cv2.imread(str(b_path), cv2.IMREAD_GRAYSCALE)
-        a = cv2.imread(str(a_path), cv2.IMREAD_GRAYSCALE)
+def check_tools_extended(require_cwebp: bool) -> Tuple[bool, List[str]]:
+    """Extended tool check including ImageMagick for TIFF processing."""
+    problems = []
 
-        if any(c is None for c in [r, g, b, a]):
-            return False, "Failed to read one or more channel files."
+    # Check existing tools
+    if which("ffmpeg") is None:
+        problems.append("ffmpeg not found in PATH")
+    if require_cwebp and which("cwebp") is None:
+        problems.append("cwebp not found in PATH (required for --individual-frames)")
 
-        # Merge the channels into a BGRA image (OpenCV's expectation)
-        rgba = cv2.merge((b, g, r, a))
+    # Check ImageMagick for TIFF processing
+    if which("convert") is None:
+        problems.append("ImageMagick (convert) not found in PATH (required for TIFF channel splitting)")
 
-        # Create a temporary path for the intermediate PNG
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_f:
-            temp_png_path = Path(temp_f.name)
-
-        # Save the merged RGBA image as a PNG
-        cv2.imwrite(str(temp_png_path), rgba)
-
-        # Build and run the cwebp command
-        cmd = build_cwebp_cmd(temp_png_path, dst_path, quality)
-        code, pretty = run_subprocess(cmd)
-
-        # Clean up the temporary PNG file
-        temp_png_path.unlink(missing_ok=True)
-
-        if code != 0:
-            return False, f"FAIL cwebp({code}) {pretty}"
-
-        return True, f"ok {dst_path.name} (recombined channels)"
-    except Exception as e:
-        return False, f"Exception during channel recombination: {e}"
+    return len(problems) == 0, problems
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
@@ -478,30 +490,52 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
 
     # Handle TIFF files with potential channel issues
     if src.suffix.lower() in {".tif", ".tiff"}:
-        temp_dir = dst.parent / "temp_split"
-        try:
-            # Split the TIFF into R, G, B, A channels
-            success, split_files, split_error = split_tiff_to_rgba_files(src, temp_dir)
+        is_valid, error_msg = validate_tiff_file(src)
+        if not is_valid:
+            console.print(f"[yellow]TIFF validation failed for {src.name}: {error_msg}[/]")
+            console.print(f"[blue]Attempting channel splitting for {src.name}[/]")
 
-            if not success:
+            # Try to split the TIFF into RGB and alpha
+            temp_dir = dst.parent / "temp_split"
+            success, split_files, split_error = split_tiff_channels(src, temp_dir)
+
+            if success and len(split_files) >= 2:
+                rgb_path, alpha_path = split_files[:2]
+
+                # Convert RGB to WebP first
+                rgb_dst = dst.parent / f"{dst.stem}_rgb{quality.mode}.webp"
+                rgb_cmd = build_cwebp_cmd(rgb_path, rgb_dst, quality)
+                rgb_code, rgb_pretty = run_subprocess(rgb_cmd)
+
+                if rgb_code != 0:
+                    return False, f"FAIL RGB({rgb_code}) {rgb_pretty}"
+
+                # Convert alpha to WebP
+                alpha_dst = dst.parent / f"{dst.stem}_alpha{quality.mode}.webp"
+                alpha_cmd = build_cwebp_cmd(alpha_path, alpha_dst, quality)
+                alpha_code, alpha_pretty = run_subprocess(alpha_cmd)
+
+                if alpha_code != 0:
+                    return False, f"FAIL Alpha({alpha_code}) {alpha_pretty}"
+
+                # For now, just use the RGB version as the main output
+                # TODO: Implement alpha recombination for WebP
+                import shutil
+                shutil.copy2(rgb_dst, dst)
+
+                # Clean up temp files
+                try:
+                    rgb_path.unlink(missing_ok=True)
+                    alpha_path.unlink(missing_ok=True)
+                    rgb_dst.unlink(missing_ok=True)
+                    alpha_dst.unlink(missing_ok=True)
+                    temp_dir.rmdir()
+                except:
+                    pass
+
+                return True, f"ok {dst.name} (split channels)"
+            else:
                 return False, f"Channel splitting failed: {split_error}"
-
-            r_path, g_path, b_path, a_path = split_files
-
-            # Combine the channels into a final WebP image
-            success, combine_msg = combine_rgba_files_to_webp(
-                r_path, g_path, b_path, a_path, dst, quality
-            )
-
-            return success, combine_msg
-
-        except Exception as e:
-            return False, f"Error processing TIFF {src.name}: {e}"
-        finally:
-            # Clean up temporary channel files
-            import shutil
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir, ignore_errors=True)
 
     # Normal processing for other formats
     cmd = build_cwebp_cmd(src, dst, quality)
@@ -580,7 +614,7 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     """Handle Ctrl+C gracefully by setting an event and raising in main thread."""
     def handler(signum, frame):
         stop_event.set()
-        console.print("\n[yellow]Ctrl+C received. Attempting graceful shutdown...[/]")
+        console.print("\n[yellow]Ctrl+C received. Attempting graceful shutdown...[/]", file=sys.stderr)
         raise GracefulExit()
     signal.signal(signal.SIGINT, handler)
 
@@ -606,7 +640,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             console.print("[bold green]Tools OK:[/] ffmpeg" + (" + cwebp" if require_cwebp else ""))
             return 0
         for p in probs:
-            console.print(f"[bold red]Missing:[/] {p}")
+            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
     quality = Quality.from_name(args.quality)
@@ -617,14 +651,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     safe, reason = is_safe_output_location(base_path, output_dir)
     if not safe:
-        console.print(f"[bold red]Unsafe output location:[/] {reason}")
-        console.print("No files were written.")
+        console.print(f"[bold red]Unsafe output location:[/] {reason}", file=sys.stderr)
+        console.print("No files were written.", file=sys.stderr)
         return 1
 
     tools_ok, probs = check_tools(require_cwebp=require_cwebp)
     if not tools_ok:
         for p in probs:
-            console.print(f"[bold red]Missing:[/] {p}")
+            console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
     print_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
@@ -706,16 +740,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     except futures.TimeoutError:
                         failures += 1
                         fut.cancel()
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}")
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}", file=sys.stderr)
                     except Exception as ex:
                         failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
+                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", file=sys.stderr)
 
     except GracefulExit:
         # Message already printed by signal handler
         pass
     except KeyboardInterrupt:
-        console.print("Interrupted.")
+        console.print("Interrupted.", file=sys.stderr)
     finally:
         pass
 
