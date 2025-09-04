@@ -232,41 +232,46 @@ def read_alpha_channel(path: Path) -> Tuple[Optional[np.ndarray], int, int]:
     return None, w, h
 
 
-def has_any_transparency(path: Path) -> bool:
-    """Return True if the image contains any transparency.
+def check_alpha_tiff(path: Path) -> bool:
+    """Return True if a TIFF has an alpha channel based on channel count.
 
-    Args:
-        path (Path): Image file path.
-
-    Returns:
-        bool: True when the image has an alpha channel with any pixel < 255.
-              False when there is no alpha channel or alpha is fully opaque.
+    Treats 2-channel (gray+alpha) and 4+ channel images as having alpha.
+    Does not inspect alpha pixel values; only presence by channels.
     """
-    alpha, w, h = read_alpha_channel(path)
-    if alpha is None or w == 0 or h == 0:
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
         return False
-    # Any pixel with alpha < 255 implies transparency presence
-    return bool(np.any(alpha < 255))
+    if img.ndim == 2:
+        return False
+    ch = img.shape[2]
+    return ch == 2 or ch >= 4
 
 
-def sequence_has_any_transparency(paths: Sequence[Path]) -> bool:
-    """Check whether any image in a sequence contains transparency.
+def check_alpha_png(path: Path) -> bool:
+    """Return True if a PNG has an alpha channel based on channel count.
 
-    Short-circuits on the first frame that reports transparency.
-
-    Args:
-        paths (Sequence[Path]): Image paths in the sequence.
-
-    Returns:
-        bool: True if any frame has transparency, else False.
+    Treats 2-channel (gray+alpha) and 4-channel (RGBA) PNGs as having alpha.
+    Does not inspect alpha pixel values; only presence by channels.
     """
-    for p in paths:
-        try:
-            if has_any_transparency(p):
-                return True
-        except Exception:
-            # Treat read failures as non-transparent for robustness
-            continue
+    img = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if img is None:
+        return False
+    if img.ndim == 2:
+        return False
+    ch = img.shape[2]
+    return ch == 2 or ch == 4
+
+
+def check_alpha_exists(path: Path) -> bool:
+    """Return True if the image file contains an alpha channel by channel count.
+
+    Dispatches by extension for TIFF and PNG. Other formats return False.
+    """
+    ext = path.suffix.lower()
+    if ext in {".tif", ".tiff"}:
+        return check_alpha_tiff(path)
+    if ext == ".png":
+        return check_alpha_png(path)
     return False
 
 

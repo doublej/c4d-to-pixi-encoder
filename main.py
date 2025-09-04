@@ -26,6 +26,9 @@ from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+from persistent_output import install_persistent_console
+from log_viewer import ScrollableLogViewer
+
 from rich.console import Console, Group
 from rich.layout import Layout
 from rich.live import Live
@@ -45,11 +48,15 @@ from misc import (
     run_subprocess,
     compute_sequence_256_crop,
     write_offset_json,
-    sequence_has_any_transparency,
+    check_alpha_exists,
+    check_alpha_tiff,
     image_dimensions,
 )
 from dpi_utils import read_sequence_dpi, dpi_dict
 from combine_metadata import combine_to_metadata
+
+# Ensure progress-style carriage-return writes are persisted as lines
+install_persistent_console()
 
 console = Console()
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".exr", ".dpx"}
@@ -404,9 +411,7 @@ def build_ffmpeg_individual_cmd(
         color_crf = extract_crf(quality.ffmpeg_args) or "26"
         # Detect whether TIFF has an alpha channel; if not, avoid alphaextract
         try:
-            from misc import read_alpha_channel as _rac
-            alpha_arr, _w, _h = _rac(src)
-            has_alpha = alpha_arr is not None
+            has_alpha = check_alpha_tiff(src)
         except Exception:
             has_alpha = False
 
@@ -426,9 +431,9 @@ def build_ffmpeg_individual_cmd(
                 "-crf", color_crf,
             ]
             vf = None
-            if crop_rect is not None:
-                x, y, w, h = crop_rect
-                vf = f"crop={w}:{h}:{x}:{y}"
+            # if crop_rect is not None:
+            #     x, y, w, h = crop_rect
+            #     vf = f"crop={w}:{h}:{x}:{y}"
             if vf is not None:
                 base.extend(["-vf", vf])
             base.append(str(dst))
@@ -582,10 +587,11 @@ def encode_sequence_individual(seq: SequenceInfo, out_root: Path, quality: Quali
     Convert one sequence to individual frames using thread pool.
     Returns (success, message, produced_count).
     """
-    # Skip crop computation when the sequence has no transparency
-    if not sequence_has_any_transparency(seq.frames):
-        # No transparency: use full-frame dims from the first image
-        ow, oh = image_dimensions(seq.frames[0])
+    # Decide crop based on alpha channel presence in the first frame only
+    first = seq.frames[0]
+    if not check_alpha_exists(first):
+        # No alpha channel → no need to crop by transparency
+        ow, oh = image_dimensions(first)
         cx = cy = 0
         cw, ch = ow, oh
         crop_tuple = None
@@ -678,12 +684,20 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     signal.signal(signal.SIGINT, handler)
 
 
-def start_controls_listener(pause_event: threading.Event, stop_event: threading.Event) -> threading.Thread:
+def start_controls_listener(
+    pause_event: threading.Event, 
+    stop_event: threading.Event,
+    log_viewer: Optional[ScrollableLogViewer] = None
+) -> threading.Thread:
     """Start a background thread to listen for simple controls from stdin.
 
     Controls:
       - 'p' + Enter: toggle pause/resume
       - 'q' + Enter: request quit (graceful)
+      - 'u' + Enter: scroll up in log history
+      - 'd' + Enter: scroll down in log history
+      - 't' + Enter: scroll to top of log history
+      - 'b' + Enter: scroll to bottom of log history
 
     Returns:
         Thread: The daemon thread handling input.
@@ -717,6 +731,16 @@ def start_controls_listener(pause_event: threading.Event, stop_event: threading.
                         _os.kill(_os.getpid(), signal.SIGINT)
                     except Exception:
                         pass
+                elif log_viewer:
+                    # Scrolling controls
+                    if cmd == "u":
+                        log_viewer.scroll_up(5)
+                    elif cmd == "d":
+                        log_viewer.scroll_down(5)
+                    elif cmd == "t":
+                        log_viewer.scroll_to_top()
+                    elif cmd == "b":
+                        log_viewer.scroll_to_bottom()
             except Exception:
                 break
 
@@ -797,15 +821,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     layout.split_column(
             Layout(header, name="header", size=8), Layout(name="main", ratio=1), Layout(name="footer", size=3), )
 
-    log_items: List = [sequences_table]
-    log_panel = Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan")
-    layout["main"].update(log_panel)
+    # Create scrollable log viewer with file persistence
+    log_file_path = config.output_dir / "processing.log"
+    log_viewer = ScrollableLogViewer(
+        max_visible_lines=25,  # Adjust based on typical terminal height
+        max_history=5000,
+        log_file=log_file_path
+    )
+    
+    # Add initial sequences table to log
+    for line in str(sequences_table).split('\n'):
+        if line.strip():
+            log_viewer.add_log(line)
+    
+    layout["main"].update(log_viewer.get_panel(title="Log History"))
 
     def get_footer() -> Panel:
         total = successes + failures
         elapsed = time.time() - t0
         state = "[yellow]PAUSED[/]" if pause_ev.is_set() else "running"
-        controls = "[dim]Controls: 'p' pause/resume, 'q' quit[/dim]"
+        controls = "[dim]Controls: 'p' pause/resume | 'q' quit | 'u' scroll up | 'd' scroll down | 't' top | 'b' bottom[/dim]"
         return Panel(
                 f"Processed: {total}/{len(sequences)} | "
                 f"Success: [green]{successes}[/] | "
@@ -818,27 +853,31 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     layout["footer"].update(get_footer())
 
     try:
-        with Live(layout, screen=True, redirect_stderr=False, refresh_per_second=4) as live:
+        # Use main screen buffer so all logs remain visible in the terminal
+        with Live(layout, screen=False, redirect_stderr=False, refresh_per_second=4) as live:
             # Start background listener for pause/quit controls
-            _ = start_controls_listener(pause_ev, stop_ev)
+            _ = start_controls_listener(pause_ev, stop_ev, log_viewer)
             if config.run_mode is RunMode.INDIVIDUAL:
                 # Per-sequence sequential vs threaded per-frame inside
                 for i, seq in enumerate(sequences, 1):
+
                     if stop_ev.is_set():
                         break
+
                     # Pause between sequences if requested
                     while pause_ev.is_set() and not stop_ev.is_set():
                         layout["footer"].update(get_footer())
                         time.sleep(0.2)
+
                     display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-                    log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)"))
-                    layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+                    log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)")
+                    layout["main"].update(log_viewer.get_panel(title="Log History"))
 
                     ok, msg, produced = encode_sequence_individual(
                             seq=seq, out_root=config.output_dir, quality=config.quality, threads=config.workers, timeout_sec=config.timeout_sec, fmt=config.format, pad_digits=config.pad_digits, )
                     produced_total += produced
-                    log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
-                    layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+                    log_viewer.add_log(f"    -> {msg}", style="green" if ok else "red")
+                    layout["main"].update(log_viewer.get_panel(title="Log History"))
 
                     if ok:
                         successes += 1
@@ -865,8 +904,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         except Exception:
                             pass
                         frame_paths = [p.as_posix() for p in seq.frames]
-                        # Skip crop when there is no transparency in the sequence
-                        if not sequence_has_any_transparency(seq.frames):
+                        # Skip crop when the first frame has no alpha channel
+                        if not check_alpha_exists(seq.frames[0]):
                             ow, oh = image_dimensions(seq.frames[0])
                             crop_tuple = None
                             cx = cy = 0
@@ -909,26 +948,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                                 successes += 1
                             else:
                                 failures += 1
-                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {display_path}{seq.ext} -> {out_path.name}"))
-                            log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
+                            log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {display_path}{seq.ext} -> {out_path.name}")
+                            log_viewer.add_log(f"    -> {msg}", style="green" if ok else "red")
                             if ok and size is not None:
-                                log_items.append(Text(f"    size: [green]{size:,}[/] bytes"))
+                                log_viewer.add_log(f"    size: [green]{size:,}[/] bytes")
                             # After successful encode, combine sidecars into metadata.json
                             if ok:
                                 try:
                                     combine_to_metadata(out_path.parent, out_path.name, output_name="metadata.json")
-                                    log_items.append(Text("    -> wrote metadata.json", style="green"))
+                                    log_viewer.add_log("    -> wrote metadata.json", style="green")
                                 except Exception as ex:
-                                    log_items.append(Text(f"    -> metadata combine failed: {type(ex).__name__}: {ex}", style="yellow"))
+                                    log_viewer.add_log(f"    -> metadata combine failed: {type(ex).__name__}: {ex}", style="yellow")
                         except futures.TimeoutError:
                             failures += 1
                             fut.cancel()
-                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {config.timeout_sec}s for {display_path}{seq.ext}", style="red"))
+                            log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {config.timeout_sec}s for {display_path}{seq.ext}", style="red")
                         except Exception as ex:
                             failures += 1
-                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", style="red"))
+                            log_viewer.add_log(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", style="red")
                         finally:
-                            layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+                            layout["main"].update(log_viewer.get_panel(title="Log History"))
                             layout["footer"].update(get_footer())
 
     except GracefulExit:
