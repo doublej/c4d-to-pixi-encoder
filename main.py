@@ -28,9 +28,12 @@ import cv2
 import numpy as np
 
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 console = Console()
 
@@ -452,8 +455,6 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
         if src.suffix.lower() in {".tif", ".tiff"}:
             is_valid, reason = validate_tiff_file(src)
             if not is_valid:
-                console.print(f"[yellow]Processing TIFF with alpha: {src.name} ({reason})[/yellow]")
-
                 temp_dir = dst.parent / f"temp_{dst.stem}"
                 success, temp_png_path, split_msg = split_tiff_channels(src, temp_dir)
 
@@ -558,7 +559,7 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
         raise GracefulExit()
     signal.signal(signal.SIGINT, handler)
 
-def print_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: int, mode: str, quality: Quality) -> None:
+def create_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: int, mode: str, quality: Quality) -> Panel:
     table = Table(show_header=False, box=None, padding=(0, 1))
     table.add_column(style="dim")
     table.add_column()
@@ -568,7 +569,7 @@ def print_run_header(base_path: Path, output_dir: Path, safe_msg: str, workers: 
     table.add_row("Mode:", 'individual-frames' if mode == 'individual' else 'animated')
     table.add_row("Quality:", quality.mode)
     table.add_row("Workers:", f"{workers} (cap {MAX_WORKER_CAP})")
-    console.print(Panel(table, title="[bold cyan]Run Configuration[/bold cyan]", border_style="cyan", title_align="left"))
+    return Panel(table, title="[bold cyan]Run Configuration[/bold cyan]", border_style="cyan", title_align="left")
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parse_args(argv)
@@ -601,7 +602,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             console.print(f"[bold red]Missing:[/] {p}", file=sys.stderr)
         return 1
 
-    print_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
+    header = create_run_header(base_path, output_dir, "", workers, "individual" if args.individual_frames else "animated", quality)
 
     t0 = time.time()
     sequences = find_sequences(base_path)
@@ -609,15 +610,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         console.print("[yellow]No numeric sequences (>=4 frames) found. Nothing to do.[/]")
         return 0
 
-    table = Table(title=f"Discovered {len(sequences)} sequences", show_header=True, header_style="bold magenta")
-    table.add_column("#", style="dim", width=4, justify="right")
-    table.add_column("Path")
-    table.add_column("Frames", justify="right")
-    table.add_column("Extension")
+    sequences_table = Table(title=f"Discovered {len(sequences)} sequences", show_header=True, header_style="bold magenta")
+    sequences_table.add_column("#", style="dim", width=4, justify="right")
+    sequences_table.add_column("Path")
+    sequences_table.add_column("Frames", justify="right")
+    sequences_table.add_column("Extension")
     for idx, seq in enumerate(sequences, 1):
         display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-        table.add_row(f"{idx:02d}", display_path, str(len(seq)), seq.ext)
-    console.print(table)
+        sequences_table.add_row(f"{idx:02d}", display_path, str(len(seq)), seq.ext)
 
     stop_ev = threading.Event()
     install_signal_handlers(stop_ev)
@@ -627,63 +627,97 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     produced_total = 0
     perseq_times: List[float] = []
 
-    try:
-        if args.individual_frames:
-            # Per-sequence sequential vs threaded per-frame inside
-            for i, seq in enumerate(sequences, 1):
-                if stop_ev.is_set():
-                    break
-                display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-                console.print(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)")
-                ok, msg, produced = encode_sequence_individual(
-                    seq=seq,
-                    out_root=output_dir,
-                    quality=quality,
-                    threads=workers,
-                    timeout_sec=DEFAULT_TIMEOUT_SEC,
-                )
-                produced_total += produced
-                console.print("    " + msg)
-                if ok:
-                    successes += 1
-                else:
-                    failures += 1
-        else:
-            # Animated: process pool across sequences
-            with futures.ProcessPoolExecutor(max_workers=workers) as pool:
-                fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
-                for i, seq in enumerate(sequences, 1):
-                    out_path = animated_output_path(output_dir, seq)
-                    out_path.parent.mkdir(parents=True, exist_ok=True)
-                    frame_paths = [p.as_posix() for p in seq.frames]
-                    fut = pool.submit(
-                        encode_sequence_animated_task,
-                        frame_paths,
-                        out_path.as_posix(),
-                        quality.mode,
-                        max(1, workers),
-                    )
-                    fut_map[fut] = (i, seq, out_path)
+    layout = Layout()
+    layout.split_column(
+        Layout(header, name="header", size=8),
+        Layout(name="main", ratio=1),
+        Layout(name="footer", size=3),
+    )
 
-                for fut, (i, seq, out_path) in fut_map.items():
+    log_items: List = [sequences_table]
+    log_panel = Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan")
+    layout["main"].update(log_panel)
+
+    def get_footer() -> Panel:
+        total = successes + failures
+        elapsed = time.time() - t0
+        return Panel(
+            f"Processed: {total}/{len(sequences)} | "
+            f"Success: [green]{successes}[/] | "
+            f"Failed: [red]{failures}[/] | "
+            f"Elapsed: {elapsed:.1f}s",
+            title="[cyan]Status[/]",
+            border_style="cyan",
+        )
+
+    layout["footer"].update(get_footer())
+
+    try:
+        with Live(layout, screen=True, redirect_stderr=False, refresh_per_second=4) as live:
+            if args.individual_frames:
+                # Per-sequence sequential vs threaded per-frame inside
+                for i, seq in enumerate(sequences, 1):
+                    if stop_ev.is_set():
+                        break
                     display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-                    try:
-                        ok, msg, size = fut.result(timeout=DEFAULT_TIMEOUT_SEC)
-                        if ok:
-                            successes += 1
-                        else:
+                    log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold]INDIV[/] {display_path}{seq.ext} ({len(seq)} frames)"))
+                    layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+
+                    ok, msg, produced = encode_sequence_individual(
+                        seq=seq,
+                        out_root=output_dir,
+                        quality=quality,
+                        threads=workers,
+                        timeout_sec=DEFAULT_TIMEOUT_SEC,
+                    )
+                    produced_total += produced
+                    log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
+                    layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+
+                    if ok:
+                        successes += 1
+                    else:
+                        failures += 1
+                    layout["footer"].update(get_footer())
+            else:
+                # Animated: process pool across sequences
+                with futures.ProcessPoolExecutor(max_workers=workers) as pool:
+                    fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
+                    for i, seq in enumerate(sequences, 1):
+                        out_path = animated_output_path(output_dir, seq)
+                        out_path.parent.mkdir(parents=True, exist_ok=True)
+                        frame_paths = [p.as_posix() for p in seq.frames]
+                        fut = pool.submit(
+                            encode_sequence_animated_task,
+                            frame_paths,
+                            out_path.as_posix(),
+                            quality.mode,
+                            max(1, workers),
+                        )
+                        fut_map[fut] = (i, seq, out_path)
+
+                    for fut, (i, seq, out_path) in fut_map.items():
+                        display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+                        try:
+                            ok, msg, size = fut.result(timeout=DEFAULT_TIMEOUT_SEC)
+                            if ok:
+                                successes += 1
+                            else:
+                                failures += 1
+                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {display_path}{seq.ext} -> {out_path.name}"))
+                            log_items.append(Text(f"    -> {msg}", style="green" if ok else "red"))
+                            if ok and size is not None:
+                                log_items.append(Text(f"    size: [green]{size:,}[/] bytes"))
+                        except futures.TimeoutError:
                             failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold]ANIM [/] {display_path}{seq.ext} -> {out_path.name}")
-                        console.print(f"    {msg}")
-                        if ok and size is not None:
-                            console.print(f"    size: [green]{size:,}[/] bytes")
-                    except futures.TimeoutError:
-                        failures += 1
-                        fut.cancel()
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}", file=sys.stderr)
-                    except Exception as ex:
-                        failures += 1
-                        console.print(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", file=sys.stderr)
+                            fut.cancel()
+                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold red]TIMEOUT[/] after {DEFAULT_TIMEOUT_SEC}s for {display_path}{seq.ext}", style="red"))
+                        except Exception as ex:
+                            failures += 1
+                            log_items.append(Text(f"[{i:02d}/{len(sequences)}] [bold red]ERROR[/] on {display_path}{seq.ext}: {type(ex).__name__}: {ex}", style="red"))
+                        finally:
+                            layout["main"].update(Panel(Group(*log_items), title="[cyan]Log[/]", border_style="cyan"))
+                            layout["footer"].update(get_footer())
 
     except GracefulExit:
         # Message already printed by signal handler
