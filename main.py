@@ -32,12 +32,6 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
-try:
-    from PIL import Image
-    PIL_AVAILABLE = True
-except ImportError:
-    PIL_AVAILABLE = False
-
 console = Console()
 
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".exr", ".dpx"}
@@ -207,20 +201,56 @@ def parse_stem(stem: str) -> Optional[Tuple[str, int]]:
 
 def validate_tiff_file(file_path: Path) -> Tuple[bool, str]:
     """
-    Check if a TIFF file has valid metadata for ffmpeg processing.
-    Returns (is_valid, error_message).
-    (STUBBED - always returns True)
+    Check if a TIFF file can be processed directly by cwebp.
+    TIFFs with alpha channels (4+ channels) are considered invalid for direct processing.
+    Returns (is_valid_for_direct_processing, reason).
     """
-    return True, ""
+    try:
+        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return False, "OpenCV could not read the file."
+
+        if len(img.shape) < 3 or img.shape[2] < 4:
+            return True, f"Image has {img.shape[2] if len(img.shape) > 2 else 1} channel(s), OK for direct processing."
+
+        # Has 4 or more channels, needs special handling
+        return False, f"Image has {img.shape[2]} channels and requires splitting."
+    except Exception as e:
+        return False, f"Exception during TIFF validation: {e}"
 
 
-def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, List[Path], str]:
+def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, Optional[Path], str]:
     """
-    Split a TIFF file with channel issues into RGB and alpha components.
-    Returns (success, [rgb_path, alpha_path], error_message).
-    (STUBBED - always returns False)
+    Reads a multi-channel TIFF and saves it as a temporary RGBA PNG file
+    that cwebp can handle reliably.
+    Returns (success, path_to_rgba_png|None, message).
     """
-    return False, [], "Channel splitting is disabled."
+    output_dir.mkdir(parents=True, exist_ok=True)
+    temp_png_path = output_dir / f"{file_path.stem}_rgba_temp.png"
+
+    try:
+        # Read image with all channels
+        img = cv2.imread(str(file_path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            return False, None, "OpenCV could not read file."
+
+        if len(img.shape) < 3 or img.shape[2] < 4:
+            return False, None, "Image does not have enough channels to process."
+
+        # If more than 4 channels, just take the first 4.
+        # cwebp will handle RGBA, so we hope these are the right ones.
+        if img.shape[2] > 4:
+            img = img[:, :, :4]
+
+        # Save as PNG. cv2.imwrite expects BGRA for 4-channel PNGs.
+        success = cv2.imwrite(str(temp_png_path), img)
+        if not success:
+            return False, None, "Failed to write temporary RGBA PNG file."
+
+        return True, temp_png_path, "Successfully created temporary RGBA PNG."
+
+    except Exception as e:
+        return False, None, f"Exception during channel splitting: {e}"
 
 
 def find_sequences(base_path: Path) -> List[SequenceInfo]:
@@ -413,12 +443,46 @@ def encode_one_frame(src: Path, dst: Path, quality: Quality) -> Tuple[bool, str]
     if dst.exists():
         return True, f"skip {dst.name}"
 
-    # Normal processing for all formats
-    cmd = build_cwebp_cmd(src, dst, quality)
-    code, pretty = run_subprocess(cmd)
-    if code != 0:
-        return False, f"FAIL({code}) {pretty}"
-    return True, f"ok {dst.name}"
+    temp_src_file: Optional[Path] = None
+    source_to_encode = src
+    message_suffix = ""
+
+    try:
+        # Handle TIFF files with potential channel issues
+        if src.suffix.lower() in {".tif", ".tiff"}:
+            is_valid, reason = validate_tiff_file(src)
+            if not is_valid:
+                console.print(f"[yellow]Processing TIFF with alpha: {src.name} ({reason})[/yellow]")
+
+                temp_dir = dst.parent / f"temp_{dst.stem}"
+                success, temp_png_path, split_msg = split_tiff_channels(src, temp_dir)
+
+                if success and temp_png_path:
+                    source_to_encode = temp_png_path
+                    temp_src_file = temp_png_path
+                    message_suffix = " (re-encoded via PNG)"
+                else:
+                    return False, f"FAIL: TIFF processing failed: {split_msg}"
+
+        # Normal processing for other formats, or processed TIFFs
+        cmd = build_cwebp_cmd(source_to_encode, dst, quality)
+        code, pretty = run_subprocess(cmd)
+
+        if code != 0:
+            return False, f"FAIL({code}) {pretty}"
+
+        return True, f"ok {dst.name}{message_suffix}"
+    finally:
+        # Clean up temporary file if it was created
+        if temp_src_file:
+            try:
+                parent_dir = temp_src_file.parent
+                temp_src_file.unlink()
+                # Try to remove the temp dir if it's empty
+                parent_dir.rmdir()
+            except OSError:
+                # Dir not empty, or other issue. Not critical.
+                pass
 
 
 def encode_sequence_individual(
