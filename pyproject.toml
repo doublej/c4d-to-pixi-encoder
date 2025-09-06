@@ -1,7 +1,7 @@
 [project]
-name = "ss-image-processor"
+name = "c4d-to-pixi-encoder"
 version = "0.1.0"
-description = "Python tool for converting image sequences to WebP/AVIF format"
+description = "Cinema 4D to PixiJS encoder - converts rendered sequences to WebP/AVIF with transparency"
 requires-python = ">=3.10"
 dependencies = [
     "pillow>=10.0.0",

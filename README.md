@@ -1,6 +1,6 @@
-# SS Image Processor (webpseq)
+# c4d-to-pixi-encoder
 
-A high-performance Python tool for converting image sequences to WebP/AVIF format, supporting both animated sequences and individual frame output with advanced features.
+A high-performance Python tool for converting Cinema 4D rendered image sequences to WebP/AVIF format, optimized for PixiJS applications with transparency support and metadata preservation.
 
 ## Features
 
@@ -24,8 +24,8 @@ A high-performance Python tool for converting image sequences to WebP/AVIF forma
 
 ```bash
 # Clone the repository
-git clone <repository-url>
-cd ss_image_processor
+git clone git@github.com:doublej/c4d-to-pixi-encoder.git
+cd c4d-to-pixi-encoder
 
 # Install dependencies with UV (recommended)
 uv sync
@@ -227,22 +227,4 @@ sudo apt install ffmpeg
 
 ## License
 
-[Your License Here]
-
-## Contributing
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes
-4. Run tests and linting
-5. Submit a pull request
-
-## Authors
-
-- SS Image Processor Development Team
-
-## Acknowledgments
-
-- FFmpeg team for excellent multimedia framework
-- Python Pillow and OpenCV communities
-- Contributors and testers
+MIT
