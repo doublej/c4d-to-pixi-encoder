@@ -88,7 +88,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
     p.add_argument("--first-frame-only", action="store_true", help="Process only the first frame of each sequence")
     p.add_argument("--extract-scenes", action="store_true", help="Extract first frame as scene for transitions")
-    p.add_argument("--extract-room-stills", action="store_true", help="Extract first frame of transitions as room stills")
+    p.add_argument("--no-extract-room-stills", dest="extract_room_stills", action="store_false", default=True, help="Disable extraction of room stills (enabled by default)")
     p.add_argument("--crop-alignment", type=int, default=256, help="Pixel alignment for crop boundaries (default: 256)")
     p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
     return p.parse_args(argv)

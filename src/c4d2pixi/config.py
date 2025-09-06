@@ -370,7 +370,7 @@ class Config(BaseModel):
     pad_digits: Annotated[int | None, Field(default=None, ge=1, le=10)] = None
     first_frame_only: bool = False
     extract_scenes: bool = False
-    extract_room_stills: bool = False
+    extract_room_stills: bool = True
     crop_alignment: Annotated[int, Field(default=256, gt=0)] = 256
 
     class Config:
