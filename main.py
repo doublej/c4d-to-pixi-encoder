@@ -2,814 +2,534 @@
 """
 webpseq: Convert numeric frame sequences to WebP/AVIF (animated or per-frame).
 
-Simplified version without Rich UI dependencies.
+This refactor improves readability and separations of concerns by:
+- Introducing enums for output format and run mode
+- Using a Config dataclass to pass settings
+- Splitting logic into small, single-purpose functions
+- Keeping I/O at the edges and core logic pure
 """
 
 from __future__ import annotations
 
+# Standard library imports
 import argparse
 import concurrent.futures as futures
-import itertools
 import os
 import signal
 import sys
-import tempfile
 import threading
 import time
-from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
+# Local application imports
+from combine_metadata import combine_to_metadata, write_dpi_json, write_offset_json
+from core_types import (
+    AnimatedEncodeConfig,
+    Config,
+    OutputFormat,
+    Quality,
+    RunMode,
+    SequenceInfo,
+)
+from dpi_utils import dpi_dict, read_sequence_dpi
+from crop_utils import compute_sequence_256_crop
+from image_utils import check_alpha_exists, image_dimensions
+from path_utils import is_path_inside, parse_stem, should_skip_dir
+from tool_utils import check_tools
+from persistent_output import install_persistent_console
+from sequence_processor import SequenceProcessor
 from simple_logger import SimpleLogger
 
-# Misc utilities extracted to keep main focused
-from misc import (
-    check_tools,
-    is_path_inside,
-    should_skip_dir,
-    parse_stem,
-    validate_tiff_file,
-    split_tiff_channels,
-    write_ffconcat_file,
-    run_subprocess,
-    compute_sequence_256_crop,
-    write_offset_json,
-    check_alpha_exists,
-    check_alpha_tiff,
-    image_dimensions,
-)
-from dpi_utils import read_sequence_dpi, dpi_dict
-from combine_metadata import combine_to_metadata
+# Processing constants
+STATUS_PRINT_INTERVAL = 5
+PAUSE_CHECK_INTERVAL = 0.2
+MIN_SEQUENCE_FRAMES = 4
+DEFAULT_DPI = 72.0
+CROP_ALIGNMENT_PIXELS = 256
+DEFAULT_FRAME_RATE = 30
+
+# Ensure progress-style carriage-return writes are persisted as lines
+install_persistent_console()
 
 SUPPORTED_EXTS = {".tif", ".tiff", ".png", ".jpg", ".jpeg", ".exr", ".dpx"}
-INDIVIDUAL_SUBDIR = Path("individual_frames")
 MAX_WORKER_CAP = 8
 DEFAULT_TIMEOUT_SEC = 300
 
 
-class OutputFormat(Enum):
-    """Supported output formats."""
-
-    WEBP = "webp"
-    AVIF = "avif"
-
-    @property
-    def extension(self) -> str:
-        """File extension for outputs."""
-        return self.value
-
-    def animated_codec_args(self, threads: int) -> List[str]:
-        """ffmpeg codec args for animated outputs preserving alpha."""
-        if self is OutputFormat.WEBP:
-            return ["-c:v", "libwebp", "-loop", "0", "-vf", "format=rgba", "-pix_fmt", "yuva420p", "-threads", str(max(1, threads)), ]
-        if self is OutputFormat.AVIF:
-            return ["-c:v", "libaom-av1", "-vf", "format=rgba", "-pix_fmt", "yuva444p", "-threads", str(max(1, threads)), ]
-        raise ValueError(f"Unsupported OutputFormat: {self}")
-
-    def still_codec_args(self) -> List[str]:
-        """ffmpeg codec args for still-frame outputs preserving alpha."""
-        if self is OutputFormat.WEBP:
-            return ["-vf", "format=rgba", "-c:v", "libwebp", "-pix_fmt", "yuva420p"]
-        if self is OutputFormat.AVIF:
-            return ["-vf", "format=rgba", "-c:v", "libaom-av1", "-pix_fmt", "yuva444p", "-still-picture", "1", ]
-        raise ValueError(f"Unsupported OutputFormat: {self}")
 
 
-class RunMode(Enum):
-    """Processing mode: animated or individual frames."""
-
-    ANIMATED = "animated"
-    INDIVIDUAL = "individual"
-
-
-class Quality(Enum):
-    """Quality presets map to ffmpeg codec args."""
-
-    LOW = "low"
-    MID = "mid"
-    HIGH = "high"
-    MAX = "max"
-    WEBP_LOSSLESS = "webp_lossless"
-
-    @staticmethod
-    def from_name(name: str, fmt: OutputFormat) -> Quality:
-        """Get quality from name, with webp_lossless support."""
-        if name == "webp_lossless" and fmt is OutputFormat.WEBP:
-            return Quality.WEBP_LOSSLESS
-        elif name == "webp_lossless":
-            return Quality.MAX
-        return Quality(name) if name != "webp_lossless" else Quality.MAX
-
-    @property
-    def ffmpeg_args(self) -> List[str]:
-        """Return ffmpeg quality arguments for this preset."""
-        if self is Quality.LOW:
-            return ["-quality", "60", "-compression_level", "6"]
-        elif self is Quality.MID:
-            return ["-quality", "80", "-compression_level", "4"]
-        elif self is Quality.HIGH:
-            return ["-quality", "90", "-compression_level", "3"]
-        elif self is Quality.MAX:
-            return ["-quality", "100", "-compression_level", "0"]
-        elif self is Quality.WEBP_LOSSLESS:
-            return ["-lossless", "1", "-compression_level", "5"]
-        else:
-            return []
+def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments."""
+    p = argparse.ArgumentParser(
+            prog="webpseq", description="Convert numeric frame sequences to WebP/AVIF (animated or per-frame).", formatter_class=argparse.ArgumentDefaultsHelpFormatter, )
+    p.add_argument("-p", "--base-path", type=Path, default=Path("."), help="Base path to scan")
+    p.add_argument("-o", "--output-dir", type=Path, help="Output directory. Defaults to 'outputs/{format}_renders'")
+    p.add_argument("-q", "--quality", choices=["high", "medium", "low", "lossless"], default="high", help="Quality preset")
+    p.add_argument("--format", choices=[f.value for f in OutputFormat], default=OutputFormat.WEBP.value, help="Output format")
+    p.add_argument("-i", "--individual-frames", action="store_true", help="Export individual files per frame instead of animated")
+    p.add_argument(
+            "--pad-digits", type=int, default=None, help=("Zero-padding width for per-frame filenames. "
+                                                          "When set, per-sequence numbering starts at 1 and outputs are named 00001, 00002, ... in each folder. "
+                                                          "When unset, the input filename is used."), )
+    p.add_argument("-w", "--max-workers", type=int, help="Max parallel workers (capped at 8)")
+    p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
+    p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
+    return p.parse_args(argv)
 
 
-@dataclass(frozen=True)
-class Config:
-    """Configuration for a conversion run."""
-
-    input_dirs: List[Path]
-    output_dir: Path
-    format: OutputFormat
-    quality: Quality
-    run_mode: RunMode
-    workers: int
-    timeout_sec: int
-    pad_digits: Optional[int] = None
-    exclude_dirs: Optional[List[Path]] = None
-    auto_crop: bool = False
+def build_config(args: argparse.Namespace) -> Config:
+    """Create a Config object from parsed args."""
+    fmt = OutputFormat(args.format)
+    quality = Quality.from_name(args.quality, fmt)
+    workers = pick_worker_count(args.max_workers, args.sequential)
+    base_path = args.base_path
+    output_dir = args.output_dir or Path("outputs") / f"{fmt.value}_renders"
+    run_mode = RunMode.INDIVIDUAL if args.individual_frames else RunMode.ANIMATED
+    return Config(
+            base_path=base_path, output_dir=output_dir, format=fmt, quality=quality, run_mode=run_mode, workers=workers, timeout_sec=DEFAULT_TIMEOUT_SEC, pad_digits=args.pad_digits, )
 
 
-@dataclass(frozen=True)
-class SequenceInfo:
-    """Info about one numeric frame sequence."""
+# ------------------------------
+# Environment and safety checks
+# ------------------------------
 
-    dir_path: Path
-    rel_dir: Path
-    prefix: str
-    ext: str
-    frames: List[Path]
+def pick_worker_count(requested: Optional[int], sequential: bool) -> int:
+    """Determine worker count within the cap."""
+    if sequential:
+        return 1
+    import multiprocessing
 
-    def __len__(self) -> int:
-        return len(self.frames)
-
-    @property
-    def first(self) -> Path:
-        return self.frames[0] if self.frames else Path()
-
-    @property
-    def last(self) -> Path:
-        return self.frames[-1] if self.frames else Path()
+    cores = max(1, multiprocessing.cpu_count())
+    limit = min(cores, MAX_WORKER_CAP)
+    if requested is None:
+        return limit
+    return max(1, min(requested, MAX_WORKER_CAP))
 
 
-def find_sequences(input_dirs: List[Path], exclude: Optional[List[Path]] = None) -> List[SequenceInfo]:
-    """Find numeric frame sequences in the input directories.
+def is_safe_output_location(base_path: Path, output_dir: Path) -> Tuple[bool, str]:
+    """
+    Allow output inside the source tree ONLY if under a folder literally named 'outputs'.
+    Also reject cases where base lives inside output (overlap).
+    """
+    base = base_path.resolve()
+    out = output_dir.resolve()
 
-    Args:
-        input_dirs: Directories to search for frame sequences.
-        exclude: Optional list of directories to exclude.
+    # base inside out → unsafe (scans would traverse outputs)
+    if is_path_inside(base, out):
+        return False, f"Output directory {out} contains base path {base} (unsafe overlap)."
 
-    Returns:
-        List[SequenceInfo]: Discovered sequences sorted by directory and prefix.
+    # out inside base → must be under 'outputs'
+    if is_path_inside(out, base):
+        rel = out.relative_to(base)
+        if "outputs" not in rel.parts:
+            return False, f"Output directory {out} is inside base path {base} but not under an 'outputs' folder."
+    return True, ""
+
+
+
+
+def find_sequences(base_path: Path) -> List[SequenceInfo]:
+    """
+    Walk base_path and detect frame sequences.
+    A sequence is a series of files in the same directory, with the same extension,
+    and filenames that end in a number (e.g., "render_001.png", "render_002.png").
+    Sequences must have at least MIN_SEQUENCE_FRAMES frames.
     """
     sequences: List[SequenceInfo] = []
-    exclude_set = set(exclude or [])
+    base = base_path.resolve()
 
-    for base in input_dirs:
-        for root, dirs, files in os.walk(base, topdown=True):
-            root_path = Path(root)
+    for dirpath, dirnames, filenames in os.walk(base):
+        # prune directories in-place
+        dirnames[:] = [d for d in dirnames if not should_skip_dir(d)]
+        dpath = Path(dirpath)
 
-            # Prune unwanted directories
-            if root_path in exclude_set or should_skip_dir(root_path.name):
-                dirs[:] = []
+        # Group files by (prefix, extension) in this directory
+        potential_sequences: Dict[Tuple[str, str], List[Tuple[int, Path]]] = {}
+        for f_name in filenames:
+            f_path = dpath / f_name
+            ext = f_path.suffix.lower()
+            if ext not in SUPPORTED_EXTS:
                 continue
 
-            # Group files by prefix and extension
-            by_prefix: Dict[Tuple[str, str], List[Path]] = {}
-            for f in files:
-                fp = Path(f)
-                if fp.suffix.lower() not in SUPPORTED_EXTS:
-                    continue
-                if fp.name.startswith("."):
-                    continue
+            parsed = parse_stem(f_path.stem)
+            if parsed:
+                prefix, frame_num = parsed
+                potential_sequences.setdefault((prefix, ext), []).append((frame_num, f_path))
 
-                # Try parsing with and without a common separator
-                parsed = parse_stem(fp.stem, separator="_")
-                if parsed is None:
-                    parsed = parse_stem(fp.stem, separator=".")
-                if parsed is None:
-                    parsed = parse_stem(fp.stem, separator=None)
+        # Filter for actual sequences (>= MIN_SEQUENCE_FRAMES frames) and create SequenceInfo
+        for (prefix, ext), frames_with_nums in potential_sequences.items():
+            if len(frames_with_nums) < MIN_SEQUENCE_FRAMES:
+                continue
 
-                if parsed:
-                    prefix, _ = parsed
-                    key = (prefix, fp.suffix.lower())
-                    by_prefix.setdefault(key, []).append(root_path / f)
+            # Sort by frame number and extract just the paths
+            frames_with_nums.sort(key=lambda item: item[0])
+            sorted_frames = [p for _, p in frames_with_nums]
 
-            # Build sequences from groups
-            for (prefix, ext), frames in by_prefix.items():
-                if len(frames) >= 4:
-                    frames.sort()
-                    rel = root_path.relative_to(base) if is_path_inside(root_path, base) else Path()
-                    sequences.append(
-                        SequenceInfo(dir_path=root_path, rel_dir=rel, prefix=prefix, ext=ext, frames=frames, ))
+            rel_dir = dpath.relative_to(base)
+            sequences.append(
+                    SequenceInfo(
+                            dir_path=dpath, rel_dir=rel_dir, prefix=prefix, ext=ext, frames=sorted_frames, )
+            )
 
-    sequences.sort(key=lambda s: (s.rel_dir, s.prefix))
     return sequences
 
 
-def build_ffmpeg_cmd(list_file: Path, out: Path, quality: Quality, threads: int, fmt: OutputFormat, crop_rect: Optional[Tuple[int, int, int, int]] = None, ) -> List[str]:
-    """Build ffmpeg command for animated output with quality preset."""
-    base = ["ffmpeg", "-f", "concat", "-safe", "0", "-i", str(list_file), "-hide_banner", "-loglevel", "error", "-nostdin", "-an", ]
-    base.extend(fmt.animated_codec_args(threads))
-    base.extend(quality.ffmpeg_args)
+# ------------------------------
+# Output path resolution
+# ------------------------------
 
-    if crop_rect is not None:
-        x, y, w, h = crop_rect
-        base.extend(["-vf", f"crop={w}:{h}:{x}:{y}"])
-
-    base.append(str(out))
-    return base
-
-
-def encode_sequence_animated_task(frame_paths: List[str], out_path: str, quality_mode: str, threads: int, format_value: str, crop_rect: Optional[Tuple[int, int, int, int]] = None, offsets_json: Optional[str] = None, seq_orig_w: Optional[int] = None, seq_orig_h: Optional[int] = None, ) -> Tuple[bool, str, Optional[int]]:
+def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
     """
-    Child-process-safe function to encode one sequence to an animated image.
-    Returns (success, message, output_size_bytes|None).
+    Place one output file per sequence under output_root mirroring the relative directory.
     """
-    try:
-        fmt = OutputFormat(format_value)
-        q = Quality.from_name(quality_mode, fmt)
-        out = Path(out_path)
-        out.parent.mkdir(parents=True, exist_ok=True)
-
-        # Reuse if exists
-        if out.exists():
-            size = out.stat().st_size
-            return True, f"SKIP exists: {out.name} ({size} bytes)", size
-
-        with tempfile.TemporaryDirectory(prefix="webpseq_") as td:
-            list_file = write_ffconcat_file([Path(p) for p in frame_paths], Path(td))
-            cmd = build_ffmpeg_cmd(list_file, out, q, threads, fmt, crop_rect)
-            # Avoid printing from subprocess; parent logs the command via returned message
-            code, pretty = run_subprocess(cmd, log=False)
-            if code != 0:
-                return False, f"ffmpeg failed: {pretty}", None
-
-        size = out.stat().st_size if out.exists() else None
-        # Optionally write offsets JSON next to the animated output
-        if offsets_json and seq_orig_w is not None and seq_orig_h is not None:
-            from misc import write_offset_json as _woj
-            if crop_rect is not None:
-                cx, cy, cw, ch = crop_rect
-            else:
-                cx, cy, cw, ch = 0, 0, seq_orig_w, seq_orig_h
-            _woj(Path(offsets_json), cx, cy, cw, ch, seq_orig_w, seq_orig_h)
-        # Include the command string in success message for visibility in parent logs
-        return True, f"DONE: {out.name} ({size} bytes) | cmd: {pretty}", size
-    except Exception as ex:
-        return False, f"EXC {type(ex).__name__}: {ex}", None
-
-
-def build_ffmpeg_cmd_frame(src: Path, dst: Path, quality: Quality, fmt: OutputFormat, crop_rect: Optional[Tuple[int, int, int, int]] = None, ) -> List[str]:
-    """Build ffmpeg command for a single-frame image with quality preset.
-
-    Args:
-        src: Input image file.
-        dst: Output file path.
-        quality: Quality preset to use.
-        fmt: Output format.
-        crop_rect: Optional crop (x, y, width, height) in pixels.
-
-    Returns:
-        List[str]: Command and arguments for subprocess.
-    """
-    dst.parent.mkdir(parents=True, exist_ok=True)
-
-    if fmt is OutputFormat.AVIF and src.suffix.lower() in {".tif", ".tiff"}:
-        def extract_crf(args: List[str]) -> Optional[str]:
-            for i, a in enumerate(args):
-                if a == "-crf" and i + 1 < len(args):
-                    return args[i + 1]
-            return None
-
-        color_crf = extract_crf(quality.ffmpeg_args) or "26"
-        # Detect whether TIFF has an alpha channel; if not, avoid alphaextract
-        try:
-            has_alpha = check_alpha_tiff(src)
-        except Exception:
-            has_alpha = False
-
-        if not has_alpha:
-            # No alpha → encode color only, optional crop, no alphaextract
-            base = [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-nostdin",
-                "-i", str(src),
-                "-an",
-                "-frames:v", "1",
-                "-c:v", "libaom-av1",
-                "-still-picture", "1",
-                "-pix_fmt", "yuv444p12le",
-                "-crf", color_crf,
-            ]
-            vf = None
-            if vf is not None:
-                base.extend(["-vf", vf])
-            base.append(str(dst))
-            return base
-        else:
-            # Has alpha → split and encode color+alpha (alpha lossless)
-            crop_expr = None
-            if crop_rect is not None:
-                x, y, w, h = crop_rect
-                crop_expr = f"[0:v]crop={w}:{h}:{x}:{y}"
-            # Ensure we always have an alpha plane for extraction
-            head = (crop_expr or "[0:v]") + ",format=rgba"
-            filter_chain = f"{head},split=2[c][asrc];[asrc]alphaextract[a]"
-
-            return [
-                "ffmpeg",
-                "-hide_banner",
-                "-loglevel", "error",
-                "-nostdin",
-                "-i", str(src),
-                "-filter_complex", filter_chain,
-                "-map", "[c]",
-                "-map", "[a]",
-                "-frames:v", "1",
-                "-c:v", "libaom-av1",
-                "-still-picture", "1",
-                "-pix_fmt:0", "yuv444p12le",
-                "-crf:0", color_crf,
-                "-pix_fmt:1", "gray12le",
-                "-crf:1", "0",
-                str(dst),
-            ]
-
-    # AVIF + PNG: preserve transparency using explicit alpha extraction
-    if fmt is OutputFormat.AVIF and src.suffix.lower() in {".png"}:
-        def extract_crf(args: List[str]) -> Optional[str]:
-            for i, a in enumerate(args):
-                if a == "-crf" and i + 1 < len(args):
-                    return args[i + 1]
-            return None
-
-        color_crf = extract_crf(quality.ffmpeg_args) or "26"
-        # Build filter chain: always ensure an alpha plane exists via format=rgba
-        # then optionally crop, split color/alpha and extract alpha.
-        chain_base = "[0:v]format=rgba"
-        if crop_rect is not None:
-            x, y, w, h = crop_rect
-            chain_base = f"{chain_base},crop={w}:{h}:{x}:{y}"
-        filter_chain = f"{chain_base},split=2[c][asrc];[asrc]alphaextract[a]"
-
-        return [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel", "error",
-            "-nostdin",
-            "-i", str(src),
-            "-filter_complex", filter_chain,
-            "-map", "[c]",
-            "-map", "[a]",
-            "-frames:v", "1",
-            "-c:v", "libaom-av1",
-            "-still-picture", "1",
-            # Use 8-bit for PNG inputs to avoid unnecessary bit-depth inflation
-            "-pix_fmt:0", "yuv444p",
-            "-crf:0", color_crf,
-            "-pix_fmt:1", "gray",
-            "-crf:1", "0",
-            str(dst),
-        ]
-
-    # Default case for WebP/other
-    base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", str(src), "-an", ]
-    base.extend(fmt.still_codec_args())
-    base.extend(quality.ffmpeg_args)
-
-    if crop_rect is not None:
-        x, y, w, h = crop_rect
-        base.extend(["-vf", f"crop={w}:{h}:{x}:{y}"])
-
-    base.append(str(dst))
-    return base
-
-
-def encode_one_frame(src: Path, dst: Path, quality: Quality, fmt: OutputFormat, crop_rect: Optional[Tuple[int, int, int, int]] = None, orig_width: Optional[int] = None, orig_height: Optional[int] = None, ) -> Tuple[bool, str]:
-    """
-    Encode one frame to output format, returning (success, message).
-    """
-    try:
-        # Reuse if exists
-        if dst.exists():
-            size = dst.stat().st_size
-            return True, f"SKIP {dst.name} exists ({size} bytes)"
-
-        cmd = build_ffmpeg_cmd_frame(src, dst, quality, fmt, crop_rect)
-        code, pretty = run_subprocess(cmd, log=True)
-        if code != 0:
-            return False, f"FAIL {dst.name} | cmd: {pretty}"
-        
-        size = dst.stat().st_size if dst.exists() else 0
-        return True, f"ok {dst.name}"
-    except Exception as ex:
-        return False, f"EXC {type(ex).__name__}: {ex}"
-
-
-def encode_sequence_individual(seq: SequenceInfo, out_root: Path, quality: Quality, threads: int, timeout_sec: int, fmt: OutputFormat, pad_digits: Optional[int] = None, logger: Optional[SimpleLogger] = None, ) -> Tuple[bool, str, int]:
-    """
-    Encode a sequence to individual frames, optionally with cropping.
-    Returns (success, message, files_produced).
-    """
-    rel_dir = out_root / INDIVIDUAL_SUBDIR / seq.rel_dir
-    # Use padding if specified; otherwise dynamic
-    tasks: List[Tuple[Path, Path]] = []
-    existing = 0
-    missing = 0
-
-    if seq.frames and fmt is OutputFormat.AVIF:
-        cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
-        if cx is not None:
-            crop_tuple: Optional[Tuple[int, int, int, int]] = (cx, cy, cw, ch)
-        else:
-            crop_tuple = None
-            ow = oh = None
-    else:
-        crop_tuple = None
-        ow = oh = None
-
-    for i, src in enumerate(seq.frames):
-        parsed = parse_stem(src.stem, separator="_") or parse_stem(src.stem, separator=".") or parse_stem(src.stem, separator=None)
-        if parsed:
-            _, frame_number = parsed
-            if pad_digits:
-                out_name = f"{frame_number:0{pad_digits}d}.{fmt.extension}"
-            else:
-                out_name = f"{frame_number}.{fmt.extension}"
-        else:
-            out_name = f"{src.stem}.{fmt.extension}"
-
-        dst = rel_dir / out_name
-        if dst.exists():
-            existing += 1
-        else:
-            missing += 1
-            tasks.append((src, dst))
-
-    # Early return if all exist
-    if not tasks:
-        return True, f"ALL {existing} frames already exist", 0
-
-    ok = True
-    start = time.time()
-    produced = 0
-    msgs: List[str] = []
-
-    def work(pair: Tuple[Path, Path]) -> Tuple[bool, str]:
-        src, dst = pair
-        return encode_one_frame(src, dst, quality, fmt, crop_tuple, ow, oh)
-
-    with futures.ThreadPoolExecutor(max_workers=max(1, threads)) as pool:
-        futs = [pool.submit(work, t) for t in tasks]
-        done, not_done = futures.wait(futs, timeout=timeout_sec)
-        if not_done:
-            for f in not_done:
-                f.cancel()
-            ok = False
-            msgs.append(f"TIMEOUT after {timeout_sec}s: {len(not_done)} tasks not finished")
-
-        # collect results from completed
-        for f in done:
-            try:
-                success, m = f.result()
-                ok = ok and success
-                if success:
-                    produced += 1
-                msgs.append(m)
-            except Exception as ex:
-                ok = False
-                msgs.append(f"EXC {type(ex).__name__}: {ex}")
-
-    elapsed = time.time() - start
-    # Write one offsets JSON and one DPI JSON for the entire sequence
-    rel_dir = out_root / INDIVIDUAL_SUBDIR / seq.rel_dir
+    # e.g., outputs/webp_renders/<rel_dir>/<prefix_or_dirname>_<ext>.webp
+    rel_target_dir = output_root / seq.rel_dir
     base_name_str = seq.prefix.strip() or seq.dir_path.name
     base_name = base_name_str.rstrip("._-")
-    json_path = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.json"
-    try:
-        write_offset_json(json_path, cx, cy, cw, ch, ow, oh)
-    except Exception:
-        pass
-    # DPI sidecar written once per sequence
-    try:
-        dpi_info = read_sequence_dpi(seq.frames)
-        from misc import write_dpi_json as _wdj
-        dpi_sidecar = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.dpi.json"
-        _wdj(dpi_sidecar, dpi_dict(dpi_info))
-    except Exception:
-        pass
-    # Combine sidecars into metadata.json per sequence
-    try:
-        combine_to_metadata(rel_dir, f"{base_name}_{seq.ext.lstrip('.')}", output_name="metadata.json")
-    except Exception:
-        pass
-    return ok, f"{produced}/{missing} created in {elapsed:.1f}s; " + " | ".join(itertools.islice(msgs, 0, 8)), produced
+    basename = f"{base_name}_{seq.ext.lstrip('.')}.{fmt.extension}"
+    return rel_target_dir / basename
 
 
-def main() -> int:
-    """Main entry point."""
-    parser = argparse.ArgumentParser(
-        prog="webpseq",
-        description="Convert numeric frame sequences to WebP/AVIF.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    
-    # Required positional OR -p for base path (for backward compatibility)
-    parser.add_argument(
-        "input_dirs", 
-        nargs="*",  # Made optional to support -p
-        type=Path, 
-        help="Input directory/directories to scan for sequences"
-    )
-    parser.add_argument(
-        "-p", "--base-path",
-        type=Path,
-        default=Path("."),
-        help="Base path to scan (alternative to positional argument)"
-    )
-    
-    # Output directory
-    parser.add_argument(
-        "-o", "--output", "--output-dir",
-        type=Path,
-        default=Path("output"),
-        help="Output directory"
-    )
-    
-    # Format
-    parser.add_argument(
-        "-f", "--format",
-        choices=["webp", "avif"],
-        default="webp",
-        help="Output format"
-    )
-    
-    # Quality
-    parser.add_argument(
-        "-q", "--quality",
-        choices=["low", "medium", "mid", "high", "max", "lossless", "webp_lossless"],
-        default="high",
-        help="Quality preset"
-    )
-    
-    # Mode - support both -m and -i flags
-    parser.add_argument(
-        "-m", "--mode",
-        choices=["animated", "individual"],
-        default="animated",
-        help="animated = one animated image per sequence, individual = separate images"
-    )
-    parser.add_argument(
-        "-i", "--individual-frames",
-        action="store_true",
-        help="Export individual files per frame instead of animated (same as -m individual)"
-    )
-    
-    # Workers
-    parser.add_argument(
-        "-j", "--jobs", "-w", "--max-workers",
-        type=int,
-        default=4,
-        dest="jobs",
-        help=f"Worker threads (max: {MAX_WORKER_CAP})"
-    )
-    
-    # Other options
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT_SEC,
-        help=f"Timeout per sequence in seconds"
-    )
-    parser.add_argument(
-        "--exclude",
-        nargs="*",
-        type=Path,
-        help="Directories to exclude from scan"
-    )
-    parser.add_argument(
-        "--pad-digits",
-        type=int,
-        help="Pad output frame numbers to N digits (e.g., 3 -> 001)"
-    )
-    parser.add_argument(
-        "--auto-crop",
-        action="store_true",
-        help="Auto-crop AVIF frames to 256x256 based on alpha edges"
-    )
-    parser.add_argument(
-        "-s", "--sequential",
-        action="store_true",
-        help="Force sequential processing (workers=1)"
-    )
 
-    args = parser.parse_args()
-    
-    # Handle backward compatibility
-    if not args.input_dirs:
-        args.input_dirs = [args.base_path]
-    
-    # Handle quality name mapping
-    if args.quality == "medium":
-        args.quality = "mid"
-    elif args.quality == "lossless":
-        args.quality = "webp_lossless"
-    
-    # Handle individual frames flag
-    if args.individual_frames:
-        args.mode = "individual"
-    
-    # Handle sequential flag
-    if args.sequential:
-        args.jobs = 1
 
-    # Setup logger
-    output_dir = args.output if hasattr(args, 'output') else args.output_dir
-    log_file = output_dir / "processing.log"
+
+
+# ------------------------------
+# Animated pipeline (process-level parallelism)
+# ------------------------------
+
+
+class GracefulExit(Exception):
+    """Signal-initiated shutdown."""
+
+
+def install_signal_handlers(stop_event: threading.Event) -> None:
+    """Handle Ctrl+C gracefully by setting an event and raising in main thread."""
+
+    def handler(signum, frame):
+        stop_event.set()
+        print("\nCtrl+C received. Attempting graceful shutdown...", file=sys.stderr)
+        raise GracefulExit()
+
+    signal.signal(signal.SIGINT, handler)
+
+
+def start_controls_listener(
+    pause_event: threading.Event, 
+    stop_event: threading.Event
+) -> threading.Thread:
+    """Start a background thread to listen for simple controls from stdin.
+
+    Controls:
+      - 'p' + Enter: toggle pause/resume
+      - 'q' + Enter: request quit (graceful)
+
+    Returns:
+        Thread: The daemon thread handling input.
+    """
+    import os as _os
+
+    def _reader() -> None:
+        if not _sys.stdin:
+            return
+        try:
+            is_tty = _sys.stdin.isatty()
+        except Exception:
+            is_tty = False
+        # Use line-buffered input to avoid raw mode complexity
+        while not stop_event.is_set():
+            try:
+                line = _sys.stdin.readline()
+                if not line:
+                    # EOF or closed stdin
+                    break
+                cmd = line.strip().lower()
+                if cmd == "p":
+                    if pause_event.is_set():
+                        pause_event.clear()
+                    else:
+                        pause_event.set()
+                elif cmd == "q":
+                    stop_event.set()
+                    try:
+                        # Trigger the SIGINT handler for consistent shutdown path
+                        _os.kill(_os.getpid(), signal.SIGINT)
+                    except Exception:
+                        pass
+            except Exception:
+                break
+
+    t = threading.Thread(target=_reader, name="controls-listener", daemon=True)
+    t.start()
+    return t
+
+
+def print_run_header(logger: SimpleLogger, config: Config, safe_msg: str) -> None:
+    """Print the run configuration."""
+    logger.section("Run Configuration")
+    rows = [
+        ["Source:", str(config.base_path.resolve())],
+        ["Output:", str(config.output_dir.resolve())],
+        ["Safety:", safe_msg or "ok"],
+        ["Format:", config.format.value.upper()],
+        ["Mode:", "individual-frames" if config.run_mode is RunMode.INDIVIDUAL else "animated"],
+        ["Quality:", config.quality.mode],
+        ["Workers:", f"{config.workers} (cap {MAX_WORKER_CAP})"],
+    ]
+    for label, value in rows:
+        logger.log(f"{label:<12} {value}")
+
+
+def process_individual_sequences(
+    sequences: List[SequenceInfo], 
+    config: Config, 
+    logger: SimpleLogger, 
+    stop_ev: threading.Event, 
+    pause_ev: threading.Event, 
+    print_status_fn
+) -> Tuple[int, int, int]:
+    """Process sequences in individual frame mode."""
+    successes = failures = produced_total = 0
+    
+    for i, seq in enumerate(sequences, 1):
+        if stop_ev.is_set():
+            break
+
+        # Pause between sequences if requested
+        while pause_ev.is_set() and not stop_ev.is_set():
+            time.sleep(PAUSE_CHECK_INTERVAL)
+
+        display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+        logger.info(f"[{i:02d}/{len(sequences)}] INDIV {display_path}{seq.ext} ({len(seq)} frames)")
+
+        ok, msg, produced = SequenceProcessor.encode_sequence_individual(
+            seq=seq, out_root=config.output_dir, quality=config.quality, 
+            threads=config.workers, timeout_sec=config.timeout_sec, 
+            fmt=config.format, pad_digits=config.pad_digits
+        )
+        produced_total += produced
+        
+        if ok:
+            logger.success(f"    -> {msg}")
+            successes += 1
+        else:
+            logger.error(f"    -> {msg}")
+            failures += 1
+        
+        # Print status periodically
+        if i % STATUS_PRINT_INTERVAL == 0 or i == len(sequences):
+            print_status_fn()
+    
+    return successes, failures, produced_total
+
+
+def process_animated_sequences(
+    sequences: List[SequenceInfo],
+    config: Config,
+    logger: SimpleLogger,
+    stop_ev: threading.Event,
+    pause_ev: threading.Event,
+    print_status_fn
+) -> Tuple[int, int]:
+    """Process sequences in animated mode using process pool."""
+    successes = failures = 0
+    
+    with futures.ProcessPoolExecutor(max_workers=config.workers) as pool:
+        fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
+        
+        for i, seq in enumerate(sequences, 1):
+            if stop_ev.is_set():
+                break
+            while pause_ev.is_set() and not stop_ev.is_set():
+                time.sleep(PAUSE_CHECK_INTERVAL)
+                
+            out_path = animated_output_path(config.output_dir, seq, config.format)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Read DPI once per sequence and write sidecar JSON next to the animated output target
+            try:
+                dpi_info = read_sequence_dpi(seq.frames)
+                write_dpi_json(out_path.with_suffix(out_path.suffix + ".dpi.json"), dpi_dict(dpi_info))
+            except Exception:
+                pass
+                
+            frame_paths = [p.as_posix() for p in seq.frames]
+            
+            # Detect alpha channel for optimization
+            has_alpha = check_alpha_exists(seq.frames[0])
+            
+            # Skip crop when the first frame has no alpha channel
+            if not has_alpha:
+                ow, oh = image_dimensions(seq.frames[0])
+                crop_tuple = None
+                cx = cy = 0
+                cw, ch = ow, oh
+            else:
+                # Compute sequence-wide crop
+                cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
+                crop_tuple: Optional[Tuple[int, int, int, int]] = None
+                if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
+                    crop_tuple = (cx, cy, cw, ch)
+                    
+            offsets_path = out_path.with_suffix(out_path.suffix + ".json")
+            encode_config = AnimatedEncodeConfig(
+                frame_paths=frame_paths,
+                out_path=out_path.as_posix(),
+                quality_mode=config.quality.mode,
+                threads=max(1, config.workers),
+                format_value=config.format.value,
+                crop_rect=crop_tuple,
+                offsets_json=offsets_path.as_posix(),
+                seq_orig_w=ow,
+                seq_orig_h=oh,
+                has_alpha=has_alpha
+            )
+            
+            display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+            logger.info(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} ({len(seq)} frames)")
+            
+            fut = pool.submit(SequenceProcessor.encode_animated_task, encode_config)
+            fut_map[fut] = (i, seq, out_path)
+            
+        # Collect results
+        for fut in futures.as_completed(fut_map.keys(), timeout=config.timeout_sec):
+            i, seq, out_path = fut_map[fut]
+            display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
+            
+            try:
+                ok, msg, produced = fut.result(timeout=config.timeout_sec)
+                if ok:
+                    logger.success(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
+                    successes += 1
+                    
+                    # Try to combine metadata
+                    try:
+                        metadata_entries = combine_to_metadata(seq.frames, (cx, cy))
+                        json_path = out_path.with_suffix(out_path.suffix + ".json")
+                        write_offset_json(json_path, metadata_entries)
+                        logger.success("    -> wrote metadata.json")
+                    except Exception as ex:
+                        logger.warning(f"    -> metadata combine failed: {type(ex).__name__}: {ex}")
+                else:
+                    logger.error(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
+                    failures += 1
+            except futures.TimeoutError:
+                failures += 1
+                fut.cancel()
+                logger.error(f"[{i:02d}/{len(sequences)}] TIMEOUT after {config.timeout_sec}s for {display_path}{seq.ext}")
+            except Exception as ex:
+                failures += 1
+                logger.error(f"[{i:02d}/{len(sequences)}] ERROR on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
+            finally:
+                # Print status periodically
+                if i % STATUS_PRINT_INTERVAL == 0 or i == len(sequences):
+                    print_status_fn()
+                    
+    return successes, failures
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    """CLI entry point."""
+    args = parse_args(argv)
+
+    if args.check_tools:
+        ok, probs = check_tools()
+        if ok:
+            print("Tools OK: ffmpeg")
+            return 0
+        for p in probs:
+            print(f"Missing: {p}", file=sys.stderr)
+        return 1
+
+    config = build_config(args)
+    log_file = config.output_dir / "processing.log"
+    config.output_dir.mkdir(parents=True, exist_ok=True)
     logger = SimpleLogger(log_file)
-    
-    logger.section("WEBPSEQ CONVERTER")
-    logger.info(f"Starting conversion run at {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    
-    # Validate inputs
-    ok, probs = check_tools()
-    if not ok:
+
+    safe, reason = is_safe_output_location(config.base_path, config.output_dir)
+    if not safe:
+        logger.error(f"Unsafe output location: {reason}")
+        logger.error("No files were written.")
+        return 1
+
+    tools_ok, probs = check_tools()
+    if not tools_ok:
         for p in probs:
             logger.error(f"Missing: {p}")
         return 1
 
-    fmt = OutputFormat(args.format)
-    quality = Quality.from_name(args.quality, fmt)
-    mode = RunMode(args.mode)
-    workers = min(args.jobs, MAX_WORKER_CAP)
-    
-    config = Config(
-        input_dirs=args.input_dirs,
-        output_dir=output_dir,
-        format=fmt,
-        quality=quality,
-        run_mode=mode,
-        workers=workers,
-        timeout_sec=args.timeout,
-        pad_digits=args.pad_digits,
-        exclude_dirs=args.exclude,
-        auto_crop=args.auto_crop,
-    )
-    
-    # Check output safety
-    safe = True
-    reason = ""
-    for input_dir in config.input_dirs:
-        if is_path_inside(config.output_dir.resolve(), input_dir.resolve()):
-            safe = False
-            reason = f"Output '{config.output_dir}' is inside input '{input_dir}'"
-            break
-    
-    if not safe:
-        logger.error(f"Unsafe output location: {reason}")
-        return 1
-    
-    # Find sequences
-    logger.info("Scanning for frame sequences...")
-    sequences = find_sequences(config.input_dirs, config.exclude_dirs)
-    
+    print_run_header(logger, config, "")
+
+    t0 = time.time()
+    sequences = find_sequences(config.base_path)
     if not sequences:
-        logger.warning("No numeric sequences (>=4 frames) found. Nothing to do.")
+        logger.warning(f"No numeric sequences (>={MIN_SEQUENCE_FRAMES} frames) found. Nothing to do.")
         return 0
-    
-    # Display found sequences
-    logger.section(f"Found {len(sequences)} sequences")
+
+    # Print discovered sequences table
+    logger.section(f"Discovered {len(sequences)} sequences")
     headers = ["#", "Path", "Frames", "Extension"]
     rows = []
-    for i, seq in enumerate(sequences, 1):
+    for idx, seq in enumerate(sequences, 1):
         display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-        rows.append([str(i).zfill(2), display_path, str(len(seq)), seq.ext])
+        rows.append([f"{idx:02d}", display_path, str(len(seq)), seq.ext])
     logger.table(headers, rows)
-    
-    # Process sequences
-    logger.section("Processing")
+
+    stop_ev = threading.Event()
+    pause_ev = threading.Event()
+    install_signal_handlers(stop_ev)
+
     successes = 0
     failures = 0
-    start_time = time.time()
-    
-    if config.run_mode is RunMode.INDIVIDUAL:
-        # Individual frames mode
-        for i, seq in enumerate(sequences, 1):
-            display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-            logger.progress(i, len(sequences), f"INDIV {display_path}{seq.ext} ({len(seq)} frames)")
-            
-            ok, msg, produced = encode_sequence_individual(
-                seq=seq,
-                out_root=config.output_dir,
-                quality=config.quality,
-                threads=config.workers,
-                timeout_sec=config.timeout_sec,
-                fmt=config.format,
-                pad_digits=config.pad_digits,
-                logger=logger,
+    produced_total = 0
+    perseq_times: List[float] = []
+
+    def print_status():
+        total = successes + failures
+        elapsed = time.time() - t0
+        state = "PAUSED" if pause_ev.is_set() else "running"
+        logger.log(f"Processed: {total}/{len(sequences)} | Success: {successes} | Failed: {failures} | Elapsed: {elapsed:.1f}s | State: {state}")
+        logger.log("Controls: 'p' pause/resume | 'q' quit")
+
+    try:
+        # Start background listener for pause/quit controls
+        _ = start_controls_listener(pause_ev, stop_ev)
+        logger.info("Processing started. Controls: 'p' pause/resume | 'q' quit")
+        
+        if config.run_mode is RunMode.INDIVIDUAL:
+            successes, failures, produced_total = process_individual_sequences(
+                sequences, config, logger, stop_ev, pause_ev, print_status
             )
-            
-            if ok:
-                successes += 1
-                logger.success(f"    -> {msg}")
-            else:
-                failures += 1
-                logger.error(f"    -> {msg}")
-    
-    else:
-        # Animated mode
-        with futures.ProcessPoolExecutor(max_workers=config.workers) as executor:
-            future_to_seq: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
-            
-            for i, seq in enumerate(sequences, 1):
-                out_path = config.output_dir / seq.rel_dir / f"{seq.prefix or seq.dir_path.name}.{config.format.extension}"
-                display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-                
-                logger.info(f"[{i}/{len(sequences)}] Submitting ANIM {display_path}{seq.ext} ({len(seq)} frames)")
-                
-                frame_paths = [str(f) for f in seq.frames]
-                offsets_json_path = out_path.with_suffix(".json")
-                orig_w, orig_h = (None, None)
-                crop_rect = None
-                
-                if config.auto_crop and config.format is OutputFormat.AVIF and seq.frames:
-                    cx, cy, cw, ch, orig_w, orig_h = compute_sequence_256_crop(seq.frames)
-                    if cx is not None:
-                        crop_rect = (cx, cy, cw, ch)
-                
-                fut = executor.submit(
-                    encode_sequence_animated_task,
-                    frame_paths,
-                    str(out_path),
-                    config.quality.value,
-                    config.workers,
-                    config.format.value,
-                    crop_rect,
-                    str(offsets_json_path) if crop_rect else None,
-                    orig_w,
-                    orig_h,
-                )
-                future_to_seq[fut] = (i, seq, out_path)
-            
-            # Wait for results
-            for fut in futures.as_completed(future_to_seq, timeout=None):
-                i, seq, out_path = future_to_seq[fut]
-                display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-                
-                try:
-                    fut_result = fut.result(timeout=config.timeout_sec)
-                    if fut_result is None:
-                        failures += 1
-                        logger.error(f"[{i}/{len(sequences)}] ANIM {display_path}{seq.ext} -> None result")
-                        continue
-                    
-                    ok, msg, size = fut_result
-                    if ok:
-                        successes += 1
-                        logger.success(f"[{i}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {out_path.name}")
-                        logger.info(f"    -> {msg}")
-                        if size is not None:
-                            logger.info(f"    size: {size:,} bytes")
-                        
-                        # Combine metadata
-                        try:
-                            combine_to_metadata(out_path.parent, out_path.name, output_name="metadata.json")
-                            logger.success("    -> wrote metadata.json")
-                        except Exception as ex:
-                            logger.warning(f"    -> metadata combine failed: {type(ex).__name__}: {ex}")
-                    else:
-                        failures += 1
-                        logger.error(f"[{i}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {out_path.name}")
-                        logger.error(f"    -> {msg}")
-                        
-                except futures.TimeoutError:
-                    failures += 1
-                    fut.cancel()
-                    logger.error(f"[{i}/{len(sequences)}] TIMEOUT after {config.timeout_sec}s for {display_path}{seq.ext}")
-                except Exception as ex:
-                    failures += 1
-                    logger.error(f"[{i}/{len(sequences)}] ERROR on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
-    
-    # Summary
-    total_time = time.time() - start_time
+        else:
+            successes, failures = process_animated_sequences(
+                sequences, config, logger, stop_ev, pause_ev, print_status
+            )
+
+    except GracefulExit:
+        # Message already printed by signal handler
+        pass
+    except KeyboardInterrupt:
+        print("Interrupted.", file=sys.stderr)
+
+    total_time = time.time() - t0
     total_sequences = len(sequences)
     avg = (total_time / max(1, total_sequences)) if total_sequences else 0.0
-    
+
+    # Print summary
     logger.section("Summary")
-    logger.info(f"Total sequences: {total_sequences}")
-    logger.info(f"Successful: {successes}")
-    logger.info(f"Failed: {failures}")
-    logger.info(f"Total time: {total_time:.1f}s")
-    logger.info(f"Average per sequence: {avg:.1f}s")
-    logger.info(f"Output directory: {config.output_dir}")
+    rows = [
+        ["Sequences OK:", str(successes)],
+        ["Sequences Failed:", str(failures)],
+        ["Total Time:", f"{total_time:.1f}s"],
+        ["Avg Time/Seq:", f"{avg:.1f}s"],
+    ]
+    if config.run_mode is RunMode.INDIVIDUAL:
+        rows.append(["Frames Created:", f"{produced_total:,}"])
     
+    for label, value in rows:
+        logger.log(f"{label:<20} {value}")
+
     return 0 if failures == 0 else 1
 
 

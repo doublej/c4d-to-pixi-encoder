@@ -313,5 +313,45 @@ def main(argv: Optional[list[str]] = None) -> int:
     return 0
 
 
+# -----------------------------
+# JSON Writing Utilities
+# -----------------------------
+
+def write_offset_json(json_path: Path, offset_x: int, offset_y: int, crop_w: int, crop_h: int, orig_w: int, orig_h: int) -> None:
+    """Write an offset JSON file next to the output.
+
+    Fields:
+        - offset_x, offset_y: number of pixels cropped from left and top
+        - cropped_width, cropped_height: output dimensions after crop
+        - original_width, original_height: source dimensions
+    """
+    data = {
+        "offset_x": int(offset_x),
+        "offset_y": int(offset_y),
+        "cropped_width": int(crop_w),
+        "cropped_height": int(crop_h),
+        "original_width": int(orig_w),
+        "original_height": int(orig_h),
+    }
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
+def write_dpi_json(json_path: Path, dpi_payload: Dict) -> None:
+    """Write a DPI sidecar JSON next to outputs.
+
+    Args:
+        json_path (Path): Target file path for JSON.
+        dpi_payload (Dict): Serializable DPI info (e.g., from dpi_utils.dpi_dict).
+
+    Returns:
+        None
+    """
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(dpi_payload, f, indent=2)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

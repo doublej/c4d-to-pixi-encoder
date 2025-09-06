@@ -3,7 +3,7 @@ Utilities for reading and reporting image DPI per sequence.
 
 These helpers are small, single-purpose, and avoid altering pixel data.
 They read DPI once per sequence (from the first readable frame) and
-provide a normalized value (72, 72) for downstream reporting.
+provide a normalized value (DEFAULT_DPI, DEFAULT_DPI) for downstream reporting.
 """
 
 from __future__ import annotations
@@ -14,6 +14,9 @@ from typing import Iterable, Optional, Sequence, Tuple
 
 from PIL import Image
 
+# DPI constants
+DEFAULT_DPI = 72.0
+
 
 @dataclass(frozen=True)
 class DpiInfo:
@@ -22,8 +25,8 @@ class DpiInfo:
     Attributes:
         src_x (float): Source horizontal DPI (pixels per inch).
         src_y (float): Source vertical DPI (pixels per inch).
-        normalized_x (float): Target normalized DPI (always 72).
-        normalized_y (float): Target normalized DPI (always 72).
+        normalized_x (float): Target normalized DPI (always DEFAULT_DPI).
+        normalized_y (float): Target normalized DPI (always DEFAULT_DPI).
         source_path (Optional[Path]): Path of the frame that provided the DPI, if any.
     """
 
@@ -70,8 +73,8 @@ def _read_image_dpi(path: Path) -> Optional[Tuple[float, float]]:
     return None
 
 
-def read_sequence_dpi(frames: Sequence[Path], normalized: float = 72.0) -> DpiInfo:
-    """Read DPI from the first frame that provides it; default to 72 if missing.
+def read_sequence_dpi(frames: Sequence[Path], normalized: float = DEFAULT_DPI) -> DpiInfo:
+    """Read DPI from the first frame that provides it; default to DEFAULT_DPI if missing.
 
     Args:
         frames (Sequence[Path]): Ordered sequence of frame paths.

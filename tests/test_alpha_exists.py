@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import cv2
 
-from misc import check_alpha_exists, check_alpha_png, check_alpha_tiff
+from image_utils import check_alpha_exists, check_alpha_png, check_alpha_tiff
 
 
 def write_image(path: Path, array: np.ndarray) -> None:
