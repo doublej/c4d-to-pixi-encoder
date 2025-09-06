@@ -5,12 +5,9 @@
       <sourceFolder url="file://$MODULE_DIR$/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/.venv" />
       <excludeFolder url="file://$MODULE_DIR$/output" />
-      <excludeFolder url="file://$MODULE_DIR$/src/ss_image_processor/output" />
       <excludeFolder url="file://$MODULE_DIR$/.repomap.tags.cache.v1" />
       <excludeFolder url="file://$MODULE_DIR$/.ropeproject" />
       <excludeFolder url="file://$MODULE_DIR$/node_modules" />
-      <excludeFolder url="file://$MODULE_DIR$/src/c4d2pixi/output" />
-      <excludeFolder url="file://$MODULE_DIR$/src/webpseq/output" />
     </content>
     <orderEntry type="jdk" jdkName="uv (ss_image_processor) (2)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from ss_image_processor.cli.metadata import combine_to_metadata
+from c4d2pixi.cli.metadata import combine_to_metadata
 
 
 def test_combine_and_log(tmp_path: Path):

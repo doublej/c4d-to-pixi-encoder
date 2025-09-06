@@ -25,8 +25,10 @@ from pathlib import Path
 
 # Local application imports
 from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
-from ..core.mapping import DirectoryMapper, OutputCategory
-from ..core.types import (
+from ..config import (
+    MIN_SEQUENCE_FRAMES,
+    PAUSE_CHECK_INTERVAL,
+    STATUS_PRINT_INTERVAL,
     AnimatedEncodeConfig,
     Config,
     OutputFormat,
@@ -34,6 +36,7 @@ from ..core.types import (
     RunMode,
     SequenceInfo,
 )
+from ..core.mapping import DirectoryMapper, OutputCategory
 from ..output.logger import SimpleLogger
 from ..output.persistent import install_persistent_console
 from ..processing.crop import compute_sequence_aligned_crop
@@ -43,13 +46,7 @@ from ..tools.check import check_tools
 from ..utils.dpi import dpi_dict, read_sequence_dpi
 from ..utils.path import is_path_inside, parse_stem, should_skip_dir
 
-# Processing constants
-STATUS_PRINT_INTERVAL = 5
-PAUSE_CHECK_INTERVAL = 0.2
-MIN_SEQUENCE_FRAMES = 4
-DEFAULT_DPI = 72.0
-CROP_ALIGNMENT_PIXELS = 256
-DEFAULT_FRAME_RATE = 30
+# Constants now imported from config.py
 
 # Ensure progress-style carriage-return writes are persisted as lines
 install_persistent_console()
@@ -91,6 +88,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
     p.add_argument("--first-frame-only", action="store_true", help="Process only the first frame of each sequence")
     p.add_argument("--extract-scenes", action="store_true", help="Extract first frame as scene for transitions")
+    p.add_argument("--extract-room-stills", action="store_true", help="Extract first frame of transitions as room stills")
     p.add_argument("--crop-alignment", type=int, default=256, help="Pixel alignment for crop boundaries (default: 256)")
     p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
     return p.parse_args(argv)
@@ -115,6 +113,7 @@ def build_config(args: argparse.Namespace) -> Config:
         pad_digits=args.pad_digits,
         first_frame_only=args.first_frame_only,
         extract_scenes=args.extract_scenes,
+        extract_room_stills=args.extract_room_stills,
         crop_alignment=args.crop_alignment,
     )
 
@@ -291,6 +290,74 @@ def extract_scene_from_sequence(
         return False, f"failed to extract scene: {msg}"
 
 
+def extract_room_still_from_sequence(
+    seq: SequenceInfo,
+    config: Config,
+    logger: SimpleLogger
+) -> tuple[bool, str]:
+    """
+    Extract the first frame of a place-to-place transition as a room still.
+    The first frame represents the starting room.
+    """
+    # Check if we have a mapping for this directory
+    naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
+
+    if not naming:
+        return True, "skip unmapped"
+
+    # Get the room still name (only for transitions)
+    room_still_name = naming.get_room_still_name(config.format.extension)
+    if not room_still_name:
+        # Not a transition or couldn't extract room name
+        return True, "skip non-transition"
+
+    # Get the first frame
+    if not seq.frames:
+        return False, "no frames in sequence"
+
+    first_frame = seq.frames[0]
+
+    # Generate room still output path
+    room_dir = config.output_dir / "room_stills"
+    room_dir.mkdir(parents=True, exist_ok=True)
+
+    room_path = room_dir / room_still_name
+
+    # Skip if already exists
+    if room_path.exists():
+        return True, f"room still exists: {room_still_name}"
+
+    # Process the first frame
+    from ..processing.sequence import SequenceProcessor
+
+    # Check for alpha and compute crop if needed
+    has_alpha = check_alpha_exists(first_frame)
+    if not has_alpha:
+        ow, oh = image_dimensions(first_frame)
+        crop_tuple = None
+    else:
+        # For room stills, compute crop just for the first frame
+        cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop([first_frame], config.crop_alignment)
+        crop_tuple = None if (cx == 0 and cy == 0 and cw == ow and ch == oh) else (cx, cy, cw, ch)
+
+    # Encode the frame
+    success, msg = SequenceProcessor.encode_one_frame(
+        first_frame,
+        room_path,
+        config.quality,
+        config.format,
+        crop_tuple,
+        ow,
+        oh
+    )
+
+    if success:
+        logger.success(f"Extracted room still: {room_still_name}")
+        return True, f"extracted room still: {room_still_name}"
+    else:
+        return False, f"failed to extract room still: {msg}"
+
+
 def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
     """
     Place one output file per sequence under output_root with new naming convention.
@@ -419,6 +486,7 @@ def process_individual_sequences(
             timeout_sec=config.timeout_sec,
             fmt=config.format,
             pad_digits=config.pad_digits,
+            crop_alignment=config.crop_alignment,
         )
         produced_total += produced
 
@@ -531,6 +599,14 @@ def process_animated_sequences(
                             logger.success(f"    -> {scene_msg}")
                         elif not scene_ok:
                             logger.warning(f"    -> {scene_msg}")
+                    
+                    # Extract room still for transitions
+                    if config.extract_room_stills:
+                        room_ok, room_msg = extract_room_still_from_sequence(seq, config, logger)
+                        if room_ok and "skip" not in room_msg:
+                            logger.success(f"    -> {room_msg}")
+                        elif not room_ok:
+                            logger.warning(f"    -> {room_msg}")
                 else:
                     logger.error(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
                     failures += 1

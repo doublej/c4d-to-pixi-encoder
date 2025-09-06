@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 
-from ss_image_processor.output.persistent import PersistentStream
+from c4d2pixi.output.persistent import PersistentStream
 
 
 def get_output_after_write(chunks: list[str]) -> str:

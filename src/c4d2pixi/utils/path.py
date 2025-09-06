@@ -14,8 +14,7 @@ import os
 import re
 from pathlib import Path
 
-from ..core.constants import MIN_SEQUENCE_FRAMES, SUPPORTED_IMAGE_EXTS, SUPPORTED_OUTPUT_EXTS
-from ..core.types import SequenceInfo
+from ..config import MIN_SEQUENCE_FRAMES, SUPPORTED_IMAGE_EXTS, SUPPORTED_OUTPUT_EXTS, SequenceInfo
 
 
 def is_path_inside(child: Path, parent: Path) -> bool:

@@ -9,11 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..core.types import OutputFormat, Quality
+from ..config import DEFAULT_FRAME_RATE, OutputFormat, Quality
 from .image import check_alpha_tiff
-
-# FFmpeg constants
-DEFAULT_FRAME_RATE = 30
 
 
 class FFmpegCommandBuilder:
@@ -139,11 +136,11 @@ class FFmpegCommandBuilder:
                     "-still-picture",
                     "1",
                     "-pix_fmt:0",
-                    "yuv444p12le",
+                    "yuv444p",
                     "-crf:0",
                     color_crf,
                     "-pix_fmt:1",
-                    "gray12le",
+                    "gray",
                     "-crf:1",
                     "0",
                     str(dst),

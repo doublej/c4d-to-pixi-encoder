@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-SS Image Processor (webpseq) - A Python tool for converting numeric frame sequences to WebP/AVIF format, supporting both animated sequences and per-frame output with advanced features.
+c4d-to-pixi-encoder - A Python tool for converting Cinema 4D rendered image sequences to WebP/AVIF format, optimized for PixiJS applications with transparency support and metadata preservation.
 
 ## Development Commands
 

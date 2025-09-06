@@ -7,12 +7,14 @@ dependencies = [
     "pillow>=10.0.0",
     "opencv-python>=4.12.0.88",
     "numpy>=2.2.6",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
 ]
 
 [project.scripts]
-c4d2pixi = "ss_image_processor.cli.main:main"
-c4d2pixi-viewer = "ss_image_processor.cli.viewer:main"
-c4d2pixi-metadata = "ss_image_processor.cli.metadata:main"
+c4d2pixi = "c4d2pixi.cli.main:main"
+c4d2pixi-viewer = "c4d2pixi.cli.viewer:main"
+c4d2pixi-metadata = "c4d2pixi.cli.metadata:main"
 
 [project.optional-dependencies]
 dev = [
@@ -78,7 +80,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["ss_image_processor"]
+known-first-party = ["c4d2pixi"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["S101"]  # Allow assert in tests
@@ -104,7 +106,7 @@ addopts = [
 ]
 
 [tool.coverage.run]
-source = ["src/ss_image_processor"]
+source = ["src/c4d2pixi"]
 omit = ["*/tests/*", "*/__pycache__/*"]
 
 [tool.coverage.report]

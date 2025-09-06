@@ -15,8 +15,8 @@ import time
 from pathlib import Path
 
 from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
-from ..core.mapping import DirectoryMapper, OutputCategory
-from ..core.types import AnimatedEncodeConfig, OutputFormat, Quality, SequenceInfo
+from ..config import AnimatedEncodeConfig, OutputFormat, Quality, SequenceInfo
+from ..core.mapping import DirectoryMapper
 from ..utils.dpi import dpi_dict, read_sequence_dpi
 from ..utils.subprocess import run_subprocess, write_ffconcat_file
 from .crop import compute_sequence_aligned_crop
@@ -133,6 +133,7 @@ class SequenceProcessor:
         timeout_sec: int,
         fmt: OutputFormat,
         pad_digits: int | None = None,
+        crop_alignment: int = 256,
     ) -> tuple[bool, str, int]:
         """
         Convert one sequence to individual frames using thread pool.
@@ -148,7 +149,7 @@ class SequenceProcessor:
             crop_tuple = None
         else:
             # Compute sequence-wide crop once (left→right, top→bottom; true wins)
-            cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
+            cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop(seq.frames, crop_alignment)
             crop_tuple = None
             if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
                 crop_tuple = (cx, cy, cw, ch)
@@ -198,25 +199,25 @@ class SequenceProcessor:
                     msgs.append(f"EXC {type(ex).__name__}: {ex}")
 
         elapsed = time.time() - start
-        
+
         # Get the output naming convention
         naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
-        
+
         if naming:
             # Use mapped naming convention for metadata
             rel_dir = out_root / naming.category_dir
             # Generate a consolidated metadata.json for the category
             metadata_path = rel_dir / "metadata.json"
-            
+
             # Write metadata for this sequence
             with contextlib.suppress(Exception):
                 # Read existing metadata if it exists
                 metadata = {}
                 if metadata_path.exists():
                     import json
-                    with open(metadata_path, 'r') as f:
+                    with open(metadata_path) as f:
                         metadata = json.load(f)
-                
+
                 # Add this sequence's metadata
                 sequence_key = naming.prefix
                 metadata[sequence_key] = {
@@ -226,7 +227,7 @@ class SequenceProcessor:
                     "frames": len(seq.frames),
                     "dpi": dpi_dict(read_sequence_dpi(seq.frames)) if seq.frames else {}
                 }
-                
+
                 # Write updated metadata
                 import json
                 with open(metadata_path, 'w') as f:
@@ -267,7 +268,7 @@ class SequenceProcessor:
         """
         # Check if we have a mapping for this directory
         naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
-        
+
         if naming:
             # Use mapped naming convention
             rel_dir = output_root / naming.category_dir
@@ -292,5 +293,5 @@ class SequenceProcessor:
                 name = f"{frame_index:0{pad_digits}d}.{fmt.extension}"
             else:
                 name = f"{frame.stem}.{fmt.extension}"
-        
+
         return rel_dir / name
