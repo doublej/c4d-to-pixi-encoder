@@ -8,29 +8,28 @@ both for individual frames and animated sequences.
 from __future__ import annotations
 
 import concurrent.futures as futures
+import contextlib
 import itertools
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple
 
-from core_types import SequenceInfo, Quality, OutputFormat, Config, AnimatedEncodeConfig
-from ffmpeg_builder import FFmpegCommandBuilder
-from crop_utils import compute_sequence_256_crop
-from image_utils import check_alpha_exists, image_dimensions, validate_tiff_file, split_tiff_channels
-from misc import write_ffconcat_file, run_subprocess
-from dpi_utils import read_sequence_dpi, dpi_dict
-from combine_metadata import combine_to_metadata, write_offset_json, write_dpi_json
-
+from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
+from ..core.types import AnimatedEncodeConfig, OutputFormat, Quality, SequenceInfo
+from ..utils.dpi import dpi_dict, read_sequence_dpi
+from ..utils.subprocess import run_subprocess, write_ffconcat_file
+from .crop import compute_sequence_256_crop
+from .ffmpeg import FFmpegCommandBuilder
+from .image import check_alpha_exists, image_dimensions, split_tiff_channels, validate_tiff_file
 
 INDIVIDUAL_SUBDIR = Path("individual_frames")
 
 
 class SequenceProcessor:
     """Processor for encoding image sequences."""
-    
+
     @staticmethod
-    def encode_animated_task(config: AnimatedEncodeConfig) -> Tuple[bool, str, Optional[int]]:
+    def encode_animated_task(config: AnimatedEncodeConfig) -> tuple[bool, str, int | None]:
         """
         Child-process-safe function to encode one sequence to an animated image.
         Returns (success, message, output_size_bytes|None).
@@ -48,7 +47,9 @@ class SequenceProcessor:
 
             with tempfile.TemporaryDirectory(prefix="webpseq_") as td:
                 list_file = write_ffconcat_file([Path(p) for p in config.frame_paths], Path(td))
-                cmd = FFmpegCommandBuilder.build_animated_cmd(list_file, out, q, config.threads, fmt, config.crop_rect, config.has_alpha)
+                cmd = FFmpegCommandBuilder.build_animated_cmd(
+                    list_file, out, q, config.threads, fmt, config.crop_rect, config.has_alpha
+                )
                 # Avoid printing from subprocess; parent logs the command via returned message
                 code, pretty = run_subprocess(cmd, log=False)
                 if code != 0:
@@ -75,15 +76,15 @@ class SequenceProcessor:
         dst: Path,
         quality: Quality,
         fmt: OutputFormat,
-        crop_rect: Optional[Tuple[int, int, int, int]],
+        crop_rect: tuple[int, int, int, int] | None,
         seq_orig_w: int,
         seq_orig_h: int,
-    ) -> Tuple[bool, str]:
+    ) -> tuple[bool, str]:
         """Encode one frame with an optional sequence-wide crop and write offsets JSON."""
         if dst.exists():
             return True, f"skip {dst.name}"
 
-        temp_src_file: Optional[Path] = None
+        temp_src_file: Path | None = None
         source_to_encode = src
         message_suffix = ""
 
@@ -124,14 +125,14 @@ class SequenceProcessor:
 
     @staticmethod
     def encode_sequence_individual(
-        seq: SequenceInfo, 
-        out_root: Path, 
-        quality: Quality, 
-        threads: int, 
-        timeout_sec: int, 
-        fmt: OutputFormat, 
-        pad_digits: Optional[int] = None,
-    ) -> Tuple[bool, str, int]:
+        seq: SequenceInfo,
+        out_root: Path,
+        quality: Quality,
+        threads: int,
+        timeout_sec: int,
+        fmt: OutputFormat,
+        pad_digits: int | None = None,
+    ) -> tuple[bool, str, int]:
         """
         Convert one sequence to individual frames using thread pool.
         Returns (success, message, produced_count).
@@ -152,9 +153,11 @@ class SequenceProcessor:
                 crop_tuple = (cx, cy, cw, ch)
 
         # Build tasks for missing outputs
-        tasks: List[Tuple[Path, Path]] = []
+        tasks: list[tuple[Path, Path]] = []
         for idx, f in enumerate(seq.frames, start=1):
-            dst = SequenceProcessor._individual_output_path(out_root, seq, f, fmt, frame_index=idx, pad_digits=pad_digits)
+            dst = SequenceProcessor._individual_output_path(
+                out_root, seq, f, fmt, frame_index=idx, pad_digits=pad_digits
+            )
             if not dst.exists():
                 tasks.append((f, dst))
 
@@ -166,9 +169,9 @@ class SequenceProcessor:
         produced = 0
         start = time.time()
         ok = True
-        msgs: List[str] = []
+        msgs: list[str] = []
 
-        def work(pair: Tuple[Path, Path]) -> Tuple[bool, str]:
+        def work(pair: tuple[Path, Path]) -> tuple[bool, str]:
             src, dst = pair
             return SequenceProcessor.encode_one_frame(src, dst, quality, fmt, crop_tuple, ow, oh)
 
@@ -199,32 +202,30 @@ class SequenceProcessor:
         base_name_str = seq.prefix.strip() or seq.dir_path.name
         base_name = base_name_str.rstrip("._-")
         json_path = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.json"
-        try:
+        with contextlib.suppress(Exception):
             write_offset_json(json_path, cx, cy, cw, ch, ow, oh)
-        except Exception:
-            pass
         # DPI sidecar written once per sequence
-        try:
+        with contextlib.suppress(Exception):
             dpi_info = read_sequence_dpi(seq.frames)
             dpi_sidecar = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.dpi.json"
             write_dpi_json(dpi_sidecar, dpi_dict(dpi_info))
-        except Exception:
-            pass
         # Combine sidecars into metadata.json per sequence
-        try:
+        with contextlib.suppress(Exception):
             combine_to_metadata(rel_dir, f"{base_name}_{seq.ext.lstrip('.')}", output_name="metadata.json")
-        except Exception:
-            pass
-        return ok, f"{produced}/{missing} created in {elapsed:.1f}s; " + " | ".join(itertools.islice(msgs, 0, 8)), produced
+        return (
+            ok,
+            f"{produced}/{missing} created in {elapsed:.1f}s; " + " | ".join(itertools.islice(msgs, 0, 8)),
+            produced,
+        )
 
     @staticmethod
     def _individual_output_path(
-        output_root: Path, 
-        seq: SequenceInfo, 
-        frame: Path, 
-        fmt: OutputFormat, 
-        frame_index: Optional[int] = None, 
-        pad_digits: Optional[int] = None,
+        output_root: Path,
+        seq: SequenceInfo,
+        frame: Path,
+        fmt: OutputFormat,
+        frame_index: int | None = None,
+        pad_digits: int | None = None,
     ) -> Path:
         """
         Place per-frame outputs under:

@@ -11,15 +11,15 @@ the existing pipeline, where `[srcname]` often includes the output extension
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
-
 
 # -----------------------------
 # Data structures
 # -----------------------------
+
 
 @dataclass(frozen=True)
 class PairPaths:
@@ -37,6 +37,7 @@ class PairPaths:
 # -----------------------------
 # Core helpers (pure)
 # -----------------------------
+
 
 def build_pair_paths(dir_path: Path, srcname: str) -> PairPaths:
     """Construct the two expected file paths for a given `srcname` and directory.
@@ -61,12 +62,10 @@ def validate_pair_exists(pair: PairPaths) -> None:
     """
     missing = [p for p in (pair.dpi_json, pair.meta_json) if not p.exists()]
     if missing:
-        raise FileNotFoundError(
-            "Missing required file(s): " + ", ".join(str(m) for m in missing)
-        )
+        raise FileNotFoundError("Missing required file(s): " + ", ".join(str(m) for m in missing))
 
 
-def load_json(path: Path) -> Dict:
+def load_json(path: Path) -> dict:
     """Load a JSON file into a dict with basic validation.
 
     Args:
@@ -85,7 +84,7 @@ def load_json(path: Path) -> Dict:
     return data
 
 
-def shallow_merge(left: Dict, right: Dict) -> Dict:
+def shallow_merge(left: dict, right: dict) -> dict:
     """Return a new dict with keys from both, with `right` taking precedence.
 
     Args:
@@ -100,7 +99,7 @@ def shallow_merge(left: Dict, right: Dict) -> Dict:
     return merged
 
 
-def derive_source_folder_and_frame_count(dpi_payload: Dict) -> Tuple[Optional[Path], Optional[int]]:
+def derive_source_folder_and_frame_count(dpi_payload: dict) -> tuple[Path | None, int | None]:
     """Compute source folder and frame count using the DPI payload's `source_path`.
 
     Counts files in the same folder with the same extension and the same numeric
@@ -141,7 +140,7 @@ def derive_source_folder_and_frame_count(dpi_payload: Dict) -> Tuple[Optional[Pa
     return folder, count
 
 
-def _parse_trailing_number(stem: str) -> Tuple[Optional[str], Optional[int]]:
+def _parse_trailing_number(stem: str) -> tuple[str | None, int | None]:
     """Return (prefix_without_trailing_digits, number) or (None, None) if absent.
 
     Args:
@@ -163,9 +162,7 @@ def _parse_trailing_number(stem: str) -> Tuple[Optional[str], Optional[int]]:
         return prefix, None
 
 
-def build_output_payload(
-    merged: Dict, source_folder: Optional[Path], frame_count: Optional[int]
-) -> Dict:
+def build_output_payload(merged: dict, source_folder: Path | None, frame_count: int | None) -> dict:
     """Assemble the final `metadata.json` payload.
 
     Args:
@@ -176,7 +173,7 @@ def build_output_payload(
     Returns:
         Dict: Serializable payload for `metadata.json`.
     """
-    payload: Dict = {}
+    payload: dict = {}
     payload.update(merged)
     payload["source_folder"] = str(source_folder) if source_folder else None
     payload["frame_count"] = int(frame_count) if frame_count is not None else None
@@ -186,6 +183,7 @@ def build_output_payload(
 # -----------------------------
 # Orchestration (I/O at the edge)
 # -----------------------------
+
 
 def combine_to_metadata(dir_path: Path, srcname: str, output_name: str = "metadata.json") -> Path:
     """Combine `[srcname].dpi.json` and `[srcname].json` into `metadata.json`.
@@ -213,7 +211,7 @@ def combine_to_metadata(dir_path: Path, srcname: str, output_name: str = "metada
 
     # Derive source folder and frame count from the DPI payload.
     source_folder, frame_count = derive_source_folder_and_frame_count(dpi_data)
-    
+
     payload = build_output_payload(merged, source_folder, frame_count)
 
     out_path = dir_path / output_name
@@ -222,14 +220,12 @@ def combine_to_metadata(dir_path: Path, srcname: str, output_name: str = "metada
     # Cleanup: remove all JSON files in dir_path except the output_name
     for p in dir_path.glob("*.json"):
         if p.name != output_name:
-            try:
+            with contextlib.suppress(Exception):
                 p.unlink(missing_ok=True)
-            except Exception:
-                pass
     return out_path
 
 
-def autodetect_single_pair(dir_path: Path) -> Optional[str]:
+def autodetect_single_pair(dir_path: Path) -> str | None:
     """Find a single `[srcname]` that has both `.dpi.json` and `.json` files.
 
     Args:
@@ -256,7 +252,7 @@ def autodetect_single_pair(dir_path: Path) -> Optional[str]:
     return None
 
 
-def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments.
 
     Returns:
@@ -293,20 +289,18 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     return p.parse_args(argv)
 
 
-def main(argv: Optional[list[str]] = None) -> int:
+def main(argv: list[str] | None = None) -> int:
     """CLI entrypoint."""
     args = parse_args(argv)
     dir_path: Path = args.directory.resolve()
     if not dir_path.exists() or not dir_path.is_dir():
         raise NotADirectoryError(f"Not a directory: {dir_path}")
 
-    srcname: Optional[str] = args.srcname
+    srcname: str | None = args.srcname
     if not srcname:
         srcname = autodetect_single_pair(dir_path)
         if not srcname:
-            raise ValueError(
-                "Cannot autodetect a unique pair. Provide --srcname (e.g., 'myseq.webp')."
-            )
+            raise ValueError("Cannot autodetect a unique pair. Provide --srcname (e.g., 'myseq.webp').")
 
     out_path = combine_to_metadata(dir_path, srcname=srcname, output_name=args.output_name)
     print(out_path)
@@ -317,7 +311,10 @@ def main(argv: Optional[list[str]] = None) -> int:
 # JSON Writing Utilities
 # -----------------------------
 
-def write_offset_json(json_path: Path, offset_x: int, offset_y: int, crop_w: int, crop_h: int, orig_w: int, orig_h: int) -> None:
+
+def write_offset_json(
+    json_path: Path, offset_x: int, offset_y: int, crop_w: int, crop_h: int, orig_w: int, orig_h: int
+) -> None:
     """Write an offset JSON file next to the output.
 
     Fields:
@@ -338,7 +335,7 @@ def write_offset_json(json_path: Path, offset_x: int, offset_y: int, crop_w: int
         json.dump(data, f, indent=2)
 
 
-def write_dpi_json(json_path: Path, dpi_payload: Dict) -> None:
+def write_dpi_json(json_path: Path, dpi_payload: dict) -> None:
     """Write a DPI sidecar JSON next to outputs.
 
     Args:

@@ -1,0 +1,16 @@
+Metadata-Version: 2.4
+Name: ss-image-processor
+Version: 0.1.0
+Summary: Python tool for converting image sequences to WebP/AVIF format
+Requires-Python: >=3.10
+Requires-Dist: pillow>=10.0.0
+Requires-Dist: opencv-python>=4.12.0.88
+Requires-Dist: numpy>=2.2.6
+Provides-Extra: dev
+Requires-Dist: black==24.10.0; extra == "dev"
+Requires-Dist: ruff==0.8.2; extra == "dev"
+Requires-Dist: mypy==1.13.0; extra == "dev"
+Requires-Dist: pytest>=8.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.1.0; extra == "dev"
+Requires-Dist: pre-commit>=3.5.0; extra == "dev"
+Requires-Dist: types-pillow>=10.0.0; extra == "dev"

@@ -1,2 +1,6 @@
 .aider*
 output/
+.repomap*/**
+.repomap*
+.ropeproject*/**
+node_modules/

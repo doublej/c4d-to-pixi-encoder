@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import io
 
-from persistent_output import PersistentStream
+from ss_image_processor.output.persistent import PersistentStream
 
 
 def get_output_after_write(chunks: list[str]) -> str:
@@ -40,4 +40,3 @@ def test_partial_line_emitted_on_close():
     ps.write("partial line without newline")
     ps.close()
     assert buf.getvalue() == "partial line without newline\n"
-

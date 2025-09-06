@@ -8,9 +8,9 @@ provide a normalized value (DEFAULT_DPI, DEFAULT_DPI) for downstream reporting.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
 
 from PIL import Image
 
@@ -34,10 +34,10 @@ class DpiInfo:
     src_y: float
     normalized_x: float
     normalized_y: float
-    source_path: Optional[Path]
+    source_path: Path | None
 
 
-def _read_image_dpi(path: Path) -> Optional[Tuple[float, float]]:
+def _read_image_dpi(path: Path) -> tuple[float, float] | None:
     """Return (x_dpi, y_dpi) for an image, or None when unavailable.
 
     Args:
@@ -86,9 +86,21 @@ def read_sequence_dpi(frames: Sequence[Path], normalized: float = DEFAULT_DPI) -
     for p in frames:
         dpi = _read_image_dpi(p)
         if dpi is not None:
-            return DpiInfo(src_x=dpi[0], src_y=dpi[1], normalized_x=float(normalized), normalized_y=float(normalized), source_path=p)
+            return DpiInfo(
+                src_x=dpi[0],
+                src_y=dpi[1],
+                normalized_x=float(normalized),
+                normalized_y=float(normalized),
+                source_path=p,
+            )
     # Fallback when no frame provides DPI metadata
-    return DpiInfo(src_x=float(normalized), src_y=float(normalized), normalized_x=float(normalized), normalized_y=float(normalized), source_path=None)
+    return DpiInfo(
+        src_x=float(normalized),
+        src_y=float(normalized),
+        normalized_x=float(normalized),
+        normalized_y=float(normalized),
+        source_path=None,
+    )
 
 
 def dpi_dict(info: DpiInfo) -> dict:
@@ -107,4 +119,3 @@ def dpi_dict(info: DpiInfo) -> dict:
         "normalized_dpi_y": round(float(info.normalized_y), 4),
         "source_path": str(info.source_path) if info.source_path else None,
     }
-

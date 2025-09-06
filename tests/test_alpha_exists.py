@@ -1,9 +1,9 @@
 from pathlib import Path
 
-import numpy as np
 import cv2
+import numpy as np
 
-from image_utils import check_alpha_exists, check_alpha_png, check_alpha_tiff
+from ss_image_processor.processing.image import check_alpha_exists, check_alpha_png, check_alpha_tiff
 
 
 def write_image(path: Path, array: np.ndarray) -> None:
@@ -43,4 +43,3 @@ def test_check_alpha_tiff_channels(tmp_path: Path):
     write_image(p_rgba, rgba)
     assert check_alpha_tiff(p_rgba) is True
     assert check_alpha_exists(p_rgba) is True
-

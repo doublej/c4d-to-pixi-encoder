@@ -9,17 +9,16 @@ This module handles all cropping-related functionality including:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
 
-import cv2
 import numpy as np
 
 # Cropping constants
 CROP_ALIGNMENT_PIXELS = 256
 
 
-def find_transparent_256_crop(alpha: np.ndarray) -> Tuple[int, int, int, int]:
+def find_transparent_256_crop(alpha: np.ndarray) -> tuple[int, int, int, int]:
     """Compute crop rectangle by trimming fully-transparent blocks from edges.
 
     Args:
@@ -67,7 +66,7 @@ def find_transparent_256_crop(alpha: np.ndarray) -> Tuple[int, int, int, int]:
     return x0, y0, x1, y1
 
 
-def compute_256_crop(path: Path) -> Tuple[int, int, int, int, int, int]:
+def compute_256_crop(path: Path) -> tuple[int, int, int, int, int, int]:
     """Determine crop rectangle for an image file.
 
     Args:
@@ -76,8 +75,8 @@ def compute_256_crop(path: Path) -> Tuple[int, int, int, int, int, int]:
     Returns:
         Tuple[int, int, int, int, int, int]: (crop_x, crop_y, crop_w, crop_h, orig_w, orig_h)
     """
-    from image_utils import read_alpha_channel  # Avoid circular import
-    
+    from .image import read_alpha_channel  # Avoid circular import
+
     alpha, orig_w, orig_h = read_alpha_channel(path)
     if alpha is None:
         return 0, 0, orig_w, orig_h, orig_w, orig_h
@@ -86,7 +85,7 @@ def compute_256_crop(path: Path) -> Tuple[int, int, int, int, int, int]:
     return x0, y0, x1 - x0, y1 - y0, orig_w, orig_h
 
 
-def crop_filter_from_rect(x: int, y: int, w: int, h: int, orig_w: int, orig_h: int) -> Optional[str]:
+def crop_filter_from_rect(x: int, y: int, w: int, h: int, orig_w: int, orig_h: int) -> str | None:
     """Generate FFmpeg crop filter string from rectangle, or None if no cropping needed.
 
     Args:
@@ -101,7 +100,7 @@ def crop_filter_from_rect(x: int, y: int, w: int, h: int, orig_w: int, orig_h: i
     return f"crop={w}:{h}:{x}:{y}"
 
 
-def _presence_blocks(alpha: np.ndarray, block: int) -> Tuple[List[bool], List[bool]]:
+def _presence_blocks(alpha: np.ndarray, block: int) -> tuple[list[bool], list[bool]]:
     """Return per-block presence booleans for columns (x) and rows (y).
 
     Args:
@@ -132,7 +131,7 @@ def _presence_blocks(alpha: np.ndarray, block: int) -> Tuple[List[bool], List[bo
     return x_pres, y_pres
 
 
-def _combine_presence(acc: List[bool], new: List[bool]) -> List[bool]:
+def _combine_presence(acc: list[bool], new: list[bool]) -> list[bool]:
     """Combine two presence lists using logical OR.
 
     Args:
@@ -142,10 +141,10 @@ def _combine_presence(acc: List[bool], new: List[bool]) -> List[bool]:
     Returns:
         List[bool]: Combined presence list.
     """
-    return [a or b for a, b in zip(acc, new)]
+    return [a or b for a, b in zip(acc, new, strict=False)]
 
 
-def _bounds_from_presence(pres: List[bool], block: int, limit: int) -> Tuple[int, int]:
+def _bounds_from_presence(pres: list[bool], block: int, limit: int) -> tuple[int, int]:
     """Compute tight bounds from a presence list.
 
     Args:
@@ -159,13 +158,15 @@ def _bounds_from_presence(pres: List[bool], block: int, limit: int) -> Tuple[int
     # Find first and last present blocks
     first = next((i for i, p in enumerate(pres) if p), 0)
     last = len(pres) - 1 - next((i for i, p in enumerate(reversed(pres)) if p), 0)
-    
+
     start = first * block
     end = min((last + 1) * block, limit)
     return start, end
 
 
-def compute_sequence_256_crop(paths: Sequence[Path], block: int = CROP_ALIGNMENT_PIXELS) -> Tuple[int, int, int, int, int, int]:
+def compute_sequence_256_crop(
+    paths: Sequence[Path], block: int = CROP_ALIGNMENT_PIXELS
+) -> tuple[int, int, int, int, int, int]:
     """Compute crop rectangle for a sequence of images with aligned cropping.
 
     Args:
@@ -175,8 +176,8 @@ def compute_sequence_256_crop(paths: Sequence[Path], block: int = CROP_ALIGNMENT
     Returns:
         Tuple[int, int, int, int, int, int]: (crop_x, crop_y, crop_w, crop_h, orig_w, orig_h)
     """
-    from image_utils import read_alpha_channel  # Avoid circular import
-    
+    from .image import read_alpha_channel  # Avoid circular import
+
     if not paths:
         return 0, 0, 0, 0, 0, 0
 

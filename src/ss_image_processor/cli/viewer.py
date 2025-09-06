@@ -15,26 +15,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import os
-
 
 SUPPORTED_EXTS = {".webp", ".avif", ".png", ".jpg", ".jpeg"}
 
 
-def natural_key(s: str) -> List[object]:
+def natural_key(s: str) -> list[object]:
     """Split string into list of strings/ints for natural sorting."""
     return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", s)]
 
 
-def find_sequences(frames_root: Path) -> List[Tuple[Path, List[Path]]]:
+def find_sequences(frames_root: Path) -> list[tuple[Path, list[Path]]]:
     """Return list of (sequence_dir, frames) where frames are sorted by natural order."""
-    out: List[Tuple[Path, List[Path]]] = []
+    out: list[tuple[Path, list[Path]]] = []
     if not frames_root.exists():
         return out
-    for dirpath, dirnames, filenames in os_walk(frames_root):
+    for dirpath, _dirnames, filenames in os_walk(frames_root):
         d = Path(dirpath)
         frames = [d / f for f in filenames if (d / f).suffix.lower() in SUPPORTED_EXTS]
         if not frames:
@@ -50,11 +48,11 @@ def os_walk(root: Path):
 
     for dirpath, dirnames, filenames in os.walk(root):
         # Skip hidden dirs
-        dirnames[:] = [d for d in dirnames if not d.startswith('.') and d != '__pycache__']
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d != "__pycache__"]
         yield dirpath, dirnames, filenames
 
 
-def _read_metadata(seq_dir: Path) -> Dict[str, Optional[int]]:
+def _read_metadata(seq_dir: Path) -> dict[str, int | None]:
     """Read offset metadata from metadata.json if present.
 
     Returns a dict with keys: offsetX, offsetY, origW, origH (ints or None).
@@ -68,34 +66,38 @@ def _read_metadata(seq_dir: Path) -> Dict[str, Optional[int]]:
         oy = int(data.get("offset_y", 0))
         ow = data.get("original_width")
         oh = data.get("original_height")
-        ow = int(ow) if isinstance(ow, (int, float, str)) and str(ow).isdigit() else None
-        oh = int(oh) if isinstance(oh, (int, float, str)) and str(oh).isdigit() else None
+        ow = int(ow) if isinstance(ow, int | float | str) and str(ow).isdigit() else None
+        oh = int(oh) if isinstance(oh, int | float | str) and str(oh).isdigit() else None
         return {"offsetX": ox, "offsetY": oy, "origW": ow, "origH": oh}
     except Exception:
         return {"offsetX": 0, "offsetY": 0, "origW": None, "origH": None}
 
 
-def write_manifest(viewer_dir: Path, frames_root: Path, sequences: List[Tuple[Path, List[Path]]], mount_name: str = "frames") -> Path:
+def write_manifest(
+    viewer_dir: Path, frames_root: Path, sequences: list[tuple[Path, list[Path]]], mount_name: str = "frames"
+) -> Path:
     """Write viewer/manifest.json with sequences, frames, and offset metadata.
 
     Frames are referenced under a mount inside the viewer directory (default 'frames').
     It is recommended to create a symlink `viewer/frames -> frames_root`.
     """
-    manifest: List[Dict] = []
+    manifest: list[dict] = []
     for seq_dir, frames in sequences:
         rel_name = seq_dir.relative_to(frames_root).as_posix() or "."
         # reference frames via the mount inside the viewer dir
         rel_frames = [f"{mount_name}/" + p.relative_to(frames_root).as_posix() for p in frames]
         meta = _read_metadata(seq_dir)
-        manifest.append({
-            "id": rel_name,
-            "name": rel_name,
-            "frames": rel_frames,
-            "offsetX": meta["offsetX"],
-            "offsetY": meta["offsetY"],
-            "origW": meta["origW"],
-            "origH": meta["origH"],
-        })
+        manifest.append(
+            {
+                "id": rel_name,
+                "name": rel_name,
+                "frames": rel_frames,
+                "offsetX": meta["offsetX"],
+                "offsetY": meta["offsetY"],
+                "origW": meta["origW"],
+                "origH": meta["origH"],
+            }
+        )
 
     viewer_dir.mkdir(parents=True, exist_ok=True)
     out = viewer_dir / "manifest.json"
@@ -323,7 +325,12 @@ def ensure_frames_mount(viewer_dir: Path, frames_root: Path, mount_name: str = "
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Build a simple layered viewer for image sequences")
-    p.add_argument("--frames-root", type=Path, default=Path("output/individual_frames"), help="Root directory containing per-sequence frames")
+    p.add_argument(
+        "--frames-root",
+        type=Path,
+        default=Path("output/individual_frames"),
+        help="Root directory containing per-sequence frames",
+    )
     p.add_argument("--viewer-dir", type=Path, default=Path("viewer"), help="Directory to write the viewer files")
     return p.parse_args(argv)
 

@@ -10,7 +10,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import List, Optional
 
 
 class OutputFormat(Enum):
@@ -24,41 +23,82 @@ class OutputFormat(Enum):
         """File extension for outputs."""
         return self.value
 
-    def animated_codec_args(self, threads: int, has_alpha: bool = True) -> List[str]:
+    def animated_codec_args(self, threads: int, has_alpha: bool = True) -> list[str]:
         """ffmpeg codec args for animated outputs with optional alpha optimization."""
         if self is OutputFormat.WEBP:
-            return ["-c:v", "libwebp", "-loop", "0", "-vf", "format=rgba", "-pix_fmt", "yuva420p", "-threads", str(max(1, threads)), ]
+            return [
+                "-c:v",
+                "libwebp",
+                "-loop",
+                "0",
+                "-vf",
+                "format=rgba",
+                "-pix_fmt",
+                "yuva420p",
+                "-threads",
+                str(max(1, threads)),
+            ]
         if self is OutputFormat.AVIF:
             if has_alpha:
-                return ["-c:v", "libaom-av1", "-vf", "format=rgba", "-pix_fmt", "yuva444p", "-threads", str(max(1, threads)), ]
+                return [
+                    "-c:v",
+                    "libaom-av1",
+                    "-vf",
+                    "format=rgba",
+                    "-pix_fmt",
+                    "yuva444p",
+                    "-threads",
+                    str(max(1, threads)),
+                ]
             else:
                 # Optimized non-alpha settings: aomav1_crf30_s6_420p_aqmode1
                 return [
-                    "-c:v", "libaom-av1", 
-                    "-pix_fmt", "yuv420p",
-                    "-cpu-used", "6",
-                    "-crf", "30",
-                    "-aq-mode", "1",
-                    "-threads", str(max(1, threads))
+                    "-c:v",
+                    "libaom-av1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-cpu-used",
+                    "6",
+                    "-crf",
+                    "30",
+                    "-aq-mode",
+                    "1",
+                    "-threads",
+                    str(max(1, threads)),
                 ]
         raise ValueError(f"Unsupported OutputFormat: {self}")
 
-    def still_codec_args(self, has_alpha: bool = True) -> List[str]:
+    def still_codec_args(self, has_alpha: bool = True) -> list[str]:
         """ffmpeg codec args for still-frame outputs with optional alpha optimization."""
         if self is OutputFormat.WEBP:
             return ["-vf", "format=rgba", "-c:v", "libwebp", "-pix_fmt", "yuva420p"]
         if self is OutputFormat.AVIF:
             if has_alpha:
-                return ["-vf", "format=rgba", "-c:v", "libaom-av1", "-pix_fmt", "yuva444p", "-still-picture", "1", ]
+                return [
+                    "-vf",
+                    "format=rgba",
+                    "-c:v",
+                    "libaom-av1",
+                    "-pix_fmt",
+                    "yuva444p",
+                    "-still-picture",
+                    "1",
+                ]
             else:
                 # Optimized non-alpha settings: aomav1_crf30_s6_420p_aqmode1
                 return [
-                    "-c:v", "libaom-av1", 
-                    "-pix_fmt", "yuv420p",
-                    "-cpu-used", "6", 
-                    "-crf", "30",
-                    "-aq-mode", "1",
-                    "-still-picture", "1"
+                    "-c:v",
+                    "libaom-av1",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-cpu-used",
+                    "6",
+                    "-crf",
+                    "30",
+                    "-aq-mode",
+                    "1",
+                    "-still-picture",
+                    "1",
                 ]
         raise ValueError(f"Unsupported OutputFormat: {self}")
 
@@ -75,10 +115,10 @@ class Quality:
     """Encoding parameters for WebP or AVIF."""
 
     mode: str  # "high" | "medium" | "low" | "lossless"
-    ffmpeg_args: List[str]
+    ffmpeg_args: list[str]
 
     @staticmethod
-    def from_name(name: str, fmt: OutputFormat) -> "Quality":
+    def from_name(name: str, fmt: OutputFormat) -> Quality:
         """Return a quality preset for a given output format."""
         n = name.lower().strip()
         if fmt is OutputFormat.WEBP:
@@ -104,11 +144,12 @@ class Quality:
 @dataclass
 class SequenceInfo:
     """A detected numeric frame sequence."""
+
     dir_path: Path
     rel_dir: Path
     prefix: str
     ext: str
-    frames: List[Path]  # sorted numerically
+    frames: list[Path]  # sorted numerically
 
     def __len__(self) -> int:
         return len(self.frames)
@@ -125,20 +166,21 @@ class Config:
     run_mode: RunMode
     workers: int
     timeout_sec: int
-    pad_digits: Optional[int] = None
+    pad_digits: int | None = None
+    first_frame_only: bool = False
 
 
 @dataclass(frozen=True)
 class AnimatedEncodeConfig:
     """Configuration for animated sequence encoding."""
-    
-    frame_paths: List[str]
+
+    frame_paths: list[str]
     out_path: str
     quality_mode: str
     threads: int
     format_value: str
-    crop_rect: Optional[Tuple[int, int, int, int]] = None
-    offsets_json: Optional[str] = None
-    seq_orig_w: Optional[int] = None
-    seq_orig_h: Optional[int] = None
+    crop_rect: tuple[int, int, int, int] | None = None
+    offsets_json: str | None = None
+    seq_orig_w: int | None = None
+    seq_orig_h: int | None = None
     has_alpha: bool = True

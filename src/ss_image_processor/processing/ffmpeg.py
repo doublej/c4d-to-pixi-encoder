@@ -8,9 +8,9 @@ separating it from the main processing pipeline for better maintainability.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple
-from core_types import OutputFormat, Quality
-from image_utils import check_alpha_tiff
+
+from ..core.types import OutputFormat, Quality
+from .image import check_alpha_tiff
 
 # FFmpeg constants
 DEFAULT_FRAME_RATE = 30
@@ -18,7 +18,7 @@ DEFAULT_FRAME_RATE = 30
 
 class FFmpegCommandBuilder:
     """Builder class for constructing FFmpeg commands."""
-    
+
     @staticmethod
     def build_animated_cmd(
         list_file: Path,
@@ -26,21 +26,27 @@ class FFmpegCommandBuilder:
         quality: Quality,
         threads: int,
         fmt: OutputFormat,
-        crop_rect: Optional[Tuple[int, int, int, int]] = None,
+        crop_rect: tuple[int, int, int, int] | None = None,
         has_alpha: bool = True,
-    ) -> List[str]:
+    ) -> list[str]:
         """Create ffmpeg command for an animated image sequence, with optional crop and alpha optimization."""
         base = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
             "-nostdin",
-            "-f", "concat",
-            "-safe", "0",
-            "-i", str(list_file),
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(list_file),
             "-an",
-            "-vsync", "0",
-            "-r", str(DEFAULT_FRAME_RATE),
+            "-vsync",
+            "0",
+            "-r",
+            str(DEFAULT_FRAME_RATE),
         ]
         codec_args = fmt.animated_codec_args(threads, has_alpha)
         if crop_rect is not None:
@@ -61,8 +67,8 @@ class FFmpegCommandBuilder:
         dst: Path,
         quality: Quality,
         fmt: OutputFormat,
-        crop_rect: Optional[Tuple[int, int, int, int]] = None,
-    ) -> List[str]:
+        crop_rect: tuple[int, int, int, int] | None = None,
+    ) -> list[str]:
         """Create ffmpeg command for a single frame.
 
         For AVIF+TIFF, use a tested filter_complex that separates color and alpha,
@@ -84,12 +90,16 @@ class FFmpegCommandBuilder:
                 base = [
                     "ffmpeg",
                     "-hide_banner",
-                    "-loglevel", "error",
+                    "-loglevel",
+                    "error",
                     "-nostdin",
-                    "-i", str(src),
+                    "-i",
+                    str(src),
                     "-an",
-                    "-frames:v", "1",
-                ] + codec_args
+                    "-frames:v",
+                    "1",
+                    *codec_args,
+                ]
                 vf = None
                 # if crop_rect is not None:
                 #     x, y, w, h = crop_rect
@@ -111,19 +121,31 @@ class FFmpegCommandBuilder:
                 return [
                     "ffmpeg",
                     "-hide_banner",
-                    "-loglevel", "error",
+                    "-loglevel",
+                    "error",
                     "-nostdin",
-                    "-i", str(src),
-                    "-filter_complex", filter_chain,
-                    "-map", "[c]",
-                    "-map", "[a]",
-                    "-frames:v", "1",
-                    "-c:v", "libaom-av1",
-                    "-still-picture", "1",
-                    "-pix_fmt:0", "yuv444p12le",
-                    "-crf:0", color_crf,
-                    "-pix_fmt:1", "gray12le",
-                    "-crf:1", "0",
+                    "-i",
+                    str(src),
+                    "-filter_complex",
+                    filter_chain,
+                    "-map",
+                    "[c]",
+                    "-map",
+                    "[a]",
+                    "-frames:v",
+                    "1",
+                    "-c:v",
+                    "libaom-av1",
+                    "-still-picture",
+                    "1",
+                    "-pix_fmt:0",
+                    "yuv444p12le",
+                    "-crf:0",
+                    color_crf,
+                    "-pix_fmt:1",
+                    "gray12le",
+                    "-crf:1",
+                    "0",
                     str(dst),
                 ]
 
@@ -141,30 +163,44 @@ class FFmpegCommandBuilder:
             return [
                 "ffmpeg",
                 "-hide_banner",
-                "-loglevel", "error",
+                "-loglevel",
+                "error",
                 "-nostdin",
-                "-i", str(src),
-                "-filter_complex", filter_chain,
-                "-map", "[c]",
-                "-map", "[a]",
-                "-frames:v", "1",
-                "-c:v", "libaom-av1",
-                "-still-picture", "1",
+                "-i",
+                str(src),
+                "-filter_complex",
+                filter_chain,
+                "-map",
+                "[c]",
+                "-map",
+                "[a]",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "libaom-av1",
+                "-still-picture",
+                "1",
                 # Use 8-bit for PNG inputs to avoid unnecessary bit-depth inflation
-                "-pix_fmt:0", "yuv444p",
-                "-crf:0", color_crf,
-                "-pix_fmt:1", "gray",
+                "-pix_fmt:0",
+                "yuv444p",
+                "-crf:0",
+                color_crf,
+                "-pix_fmt:1",
+                "gray",
                 # Keep alpha lossless to preserve edges cleanly
-                "-crf:1", "0",
+                "-crf:1",
+                "0",
                 str(dst),
             ]
 
         base = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",
+            "-loglevel",
+            "error",
             "-nostdin",
-            "-i", str(src),
+            "-i",
+            str(src),
             "-an",
         ]
         codec_args = fmt.still_codec_args()
@@ -183,7 +219,7 @@ class FFmpegCommandBuilder:
         return base + codec_args + quality.ffmpeg_args + [str(dst)]
 
     @staticmethod
-    def _extract_crf(args: List[str]) -> Optional[str]:
+    def _extract_crf(args: list[str]) -> str | None:
         """Extract CRF value from FFmpeg arguments."""
         for i, a in enumerate(args):
             if a == "-crf" and i + 1 < len(args):

@@ -8,10 +8,9 @@ required for the image processing pipeline.
 from __future__ import annotations
 
 from shutil import which
-from typing import List, Tuple
 
 
-def check_tools() -> Tuple[bool, List[str]]:
+def check_tools() -> tuple[bool, list[str]]:
     """Check availability of required external tools.
 
     Args:
@@ -20,7 +19,7 @@ def check_tools() -> Tuple[bool, List[str]]:
     Returns:
         Tuple[bool, List[str]]: (all_ok, problems). If `all_ok` is False, problems lists the issues.
     """
-    problems: List[str] = []
+    problems: list[str] = []
     if which("ffmpeg") is None:
         problems.append("ffmpeg not found in PATH")
     return (len(problems) == 0, problems)

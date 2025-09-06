@@ -10,7 +10,6 @@ This module handles all image-related functionality including:
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -19,7 +18,7 @@ import numpy as np
 MIN_ALPHA_CHANNELS = 4
 
 
-def read_alpha_channel(path: Path) -> Tuple[Optional[np.ndarray], int, int]:
+def read_alpha_channel(path: Path) -> tuple[np.ndarray | None, int, int]:
     """Load image and return (alpha_channel, width, height).
 
     Args:
@@ -88,7 +87,7 @@ def check_alpha_exists(path: Path) -> bool:
     return False
 
 
-def image_dimensions(path: Path) -> Tuple[int, int]:
+def image_dimensions(path: Path) -> tuple[int, int]:
     """Return (width, height) of an image or (0, 0) on failure.
 
     Args:
@@ -104,7 +103,7 @@ def image_dimensions(path: Path) -> Tuple[int, int]:
     return w, h
 
 
-def validate_tiff_file(file_path: Path) -> Tuple[bool, str]:
+def validate_tiff_file(file_path: Path) -> tuple[bool, str]:
     """Check if a TIFF can be processed directly by encoders.
 
     Treat TIFFs with alpha channels (MIN_ALPHA_CHANNELS+ channels) as invalid for direct processing
@@ -129,7 +128,7 @@ def validate_tiff_file(file_path: Path) -> Tuple[bool, str]:
         return False, f"Exception during TIFF validation: {e}"
 
 
-def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, Optional[Path], str]:
+def split_tiff_channels(file_path: Path, output_dir: Path) -> tuple[bool, Path | None, str]:
     """Split multi-channel TIFF into an RGBA PNG for safer encoding.
 
     Args:
@@ -146,7 +145,11 @@ def split_tiff_channels(file_path: Path, output_dir: Path) -> Tuple[bool, Option
 
         # Check for multi-channel
         if len(img.shape) < 3 or img.shape[2] < MIN_ALPHA_CHANNELS:
-            return False, None, f"TIFF has only {img.shape[2] if len(img.shape) > 2 else 1} channel(s), no split needed."
+            return (
+                False,
+                None,
+                f"TIFF has only {img.shape[2] if len(img.shape) > 2 else 1} channel(s), no split needed.",
+            )
 
         # Ensure 4-channel RGBA
         if img.shape[2] > MIN_ALPHA_CHANNELS:

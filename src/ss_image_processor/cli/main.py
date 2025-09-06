@@ -14,17 +14,18 @@ from __future__ import annotations
 # Standard library imports
 import argparse
 import concurrent.futures as futures
+import contextlib
 import os
 import signal
 import sys
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
 
 # Local application imports
-from combine_metadata import combine_to_metadata, write_dpi_json, write_offset_json
-from core_types import (
+from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
+from ..core.types import (
     AnimatedEncodeConfig,
     Config,
     OutputFormat,
@@ -32,14 +33,14 @@ from core_types import (
     RunMode,
     SequenceInfo,
 )
-from dpi_utils import dpi_dict, read_sequence_dpi
-from crop_utils import compute_sequence_256_crop
-from image_utils import check_alpha_exists, image_dimensions
-from path_utils import is_path_inside, parse_stem, should_skip_dir
-from tool_utils import check_tools
-from persistent_output import install_persistent_console
-from sequence_processor import SequenceProcessor
-from simple_logger import SimpleLogger
+from ..output.logger import SimpleLogger
+from ..output.persistent import install_persistent_console
+from ..processing.crop import compute_sequence_256_crop
+from ..processing.image import check_alpha_exists, image_dimensions
+from ..processing.sequence import SequenceProcessor
+from ..tools.check import check_tools
+from ..utils.dpi import dpi_dict, read_sequence_dpi
+from ..utils.path import is_path_inside, parse_stem, should_skip_dir
 
 # Processing constants
 STATUS_PRINT_INTERVAL = 5
@@ -57,23 +58,37 @@ MAX_WORKER_CAP = 8
 DEFAULT_TIMEOUT_SEC = 300
 
 
-
-
-def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     p = argparse.ArgumentParser(
-            prog="webpseq", description="Convert numeric frame sequences to WebP/AVIF (animated or per-frame).", formatter_class=argparse.ArgumentDefaultsHelpFormatter, )
+        prog="webpseq",
+        description="Convert numeric frame sequences to WebP/AVIF (animated or per-frame).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     p.add_argument("-p", "--base-path", type=Path, default=Path("."), help="Base path to scan")
     p.add_argument("-o", "--output-dir", type=Path, help="Output directory. Defaults to 'outputs/{format}_renders'")
-    p.add_argument("-q", "--quality", choices=["high", "medium", "low", "lossless"], default="high", help="Quality preset")
-    p.add_argument("--format", choices=[f.value for f in OutputFormat], default=OutputFormat.WEBP.value, help="Output format")
-    p.add_argument("-i", "--individual-frames", action="store_true", help="Export individual files per frame instead of animated")
     p.add_argument(
-            "--pad-digits", type=int, default=None, help=("Zero-padding width for per-frame filenames. "
-                                                          "When set, per-sequence numbering starts at 1 and outputs are named 00001, 00002, ... in each folder. "
-                                                          "When unset, the input filename is used."), )
+        "-q", "--quality", choices=["high", "medium", "low", "lossless"], default="high", help="Quality preset"
+    )
+    p.add_argument(
+        "--format", choices=[f.value for f in OutputFormat], default=OutputFormat.WEBP.value, help="Output format"
+    )
+    p.add_argument(
+        "-i", "--individual-frames", action="store_true", help="Export individual files per frame instead of animated"
+    )
+    p.add_argument(
+        "--pad-digits",
+        type=int,
+        default=None,
+        help=(
+            "Zero-padding width for per-frame filenames. "
+            "When set, per-sequence numbering starts at 1 and outputs are named 00001, 00002, ... in each folder. "
+            "When unset, the input filename is used."
+        ),
+    )
     p.add_argument("-w", "--max-workers", type=int, help="Max parallel workers (capped at 8)")
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
+    p.add_argument("--first-frame-only", action="store_true", help="Process only the first frame of each sequence")
     p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
     return p.parse_args(argv)
 
@@ -87,14 +102,24 @@ def build_config(args: argparse.Namespace) -> Config:
     output_dir = args.output_dir or Path("outputs") / f"{fmt.value}_renders"
     run_mode = RunMode.INDIVIDUAL if args.individual_frames else RunMode.ANIMATED
     return Config(
-            base_path=base_path, output_dir=output_dir, format=fmt, quality=quality, run_mode=run_mode, workers=workers, timeout_sec=DEFAULT_TIMEOUT_SEC, pad_digits=args.pad_digits, )
+        base_path=base_path,
+        output_dir=output_dir,
+        format=fmt,
+        quality=quality,
+        run_mode=run_mode,
+        workers=workers,
+        timeout_sec=DEFAULT_TIMEOUT_SEC,
+        pad_digits=args.pad_digits,
+        first_frame_only=args.first_frame_only,
+    )
 
 
 # ------------------------------
 # Environment and safety checks
 # ------------------------------
 
-def pick_worker_count(requested: Optional[int], sequential: bool) -> int:
+
+def pick_worker_count(requested: int | None, sequential: bool) -> int:
     """Determine worker count within the cap."""
     if sequential:
         return 1
@@ -107,7 +132,7 @@ def pick_worker_count(requested: Optional[int], sequential: bool) -> int:
     return max(1, min(requested, MAX_WORKER_CAP))
 
 
-def is_safe_output_location(base_path: Path, output_dir: Path) -> Tuple[bool, str]:
+def is_safe_output_location(base_path: Path, output_dir: Path) -> tuple[bool, str]:
     """
     Allow output inside the source tree ONLY if under a folder literally named 'outputs'.
     Also reject cases where base lives inside output (overlap).
@@ -127,16 +152,18 @@ def is_safe_output_location(base_path: Path, output_dir: Path) -> Tuple[bool, st
     return True, ""
 
 
-
-
-def find_sequences(base_path: Path) -> List[SequenceInfo]:
+def find_sequences(base_path: Path, first_frame_only: bool = False) -> list[SequenceInfo]:
     """
     Walk base_path and detect frame sequences.
     A sequence is a series of files in the same directory, with the same extension,
     and filenames that end in a number (e.g., "render_001.png", "render_002.png").
     Sequences must have at least MIN_SEQUENCE_FRAMES frames.
+
+    Args:
+        base_path: Root directory to scan
+        first_frame_only: If True, only include the first frame of each sequence
     """
-    sequences: List[SequenceInfo] = []
+    sequences: list[SequenceInfo] = []
     base = base_path.resolve()
 
     for dirpath, dirnames, filenames in os.walk(base):
@@ -145,7 +172,7 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
         dpath = Path(dirpath)
 
         # Group files by (prefix, extension) in this directory
-        potential_sequences: Dict[Tuple[str, str], List[Tuple[int, Path]]] = {}
+        potential_sequences: dict[tuple[str, str], list[tuple[int, Path]]] = {}
         for f_name in filenames:
             f_path = dpath / f_name
             ext = f_path.suffix.lower()
@@ -166,10 +193,19 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
             frames_with_nums.sort(key=lambda item: item[0])
             sorted_frames = [p for _, p in frames_with_nums]
 
+            # If first_frame_only is True, only keep the first frame
+            if first_frame_only:
+                sorted_frames = sorted_frames[:1]
+
             rel_dir = dpath.relative_to(base)
             sequences.append(
-                    SequenceInfo(
-                            dir_path=dpath, rel_dir=rel_dir, prefix=prefix, ext=ext, frames=sorted_frames, )
+                SequenceInfo(
+                    dir_path=dpath,
+                    rel_dir=rel_dir,
+                    prefix=prefix,
+                    ext=ext,
+                    frames=sorted_frames,
+                )
             )
 
     return sequences
@@ -178,6 +214,7 @@ def find_sequences(base_path: Path) -> List[SequenceInfo]:
 # ------------------------------
 # Output path resolution
 # ------------------------------
+
 
 def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
     """
@@ -191,16 +228,12 @@ def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat
     return rel_target_dir / basename
 
 
-
-
-
-
 # ------------------------------
 # Animated pipeline (process-level parallelism)
 # ------------------------------
 
 
-class GracefulExit(Exception):
+class GracefulExitError(Exception):
     """Signal-initiated shutdown."""
 
 
@@ -210,15 +243,12 @@ def install_signal_handlers(stop_event: threading.Event) -> None:
     def handler(signum, frame):
         stop_event.set()
         print("\nCtrl+C received. Attempting graceful shutdown...", file=sys.stderr)
-        raise GracefulExit()
+        raise GracefulExitError()
 
     signal.signal(signal.SIGINT, handler)
 
 
-def start_controls_listener(
-    pause_event: threading.Event, 
-    stop_event: threading.Event
-) -> threading.Thread:
+def start_controls_listener(pause_event: threading.Event, stop_event: threading.Event) -> threading.Thread:
     """Start a background thread to listen for simple controls from stdin.
 
     Controls:
@@ -231,16 +261,12 @@ def start_controls_listener(
     import os as _os
 
     def _reader() -> None:
-        if not _sys.stdin:
+        if not sys.stdin:
             return
-        try:
-            is_tty = _sys.stdin.isatty()
-        except Exception:
-            is_tty = False
         # Use line-buffered input to avoid raw mode complexity
         while not stop_event.is_set():
             try:
-                line = _sys.stdin.readline()
+                line = sys.stdin.readline()
                 if not line:
                     # EOF or closed stdin
                     break
@@ -252,11 +278,9 @@ def start_controls_listener(
                         pause_event.set()
                 elif cmd == "q":
                     stop_event.set()
-                    try:
+                    with contextlib.suppress(Exception):
                         # Trigger the SIGINT handler for consistent shutdown path
                         _os.kill(_os.getpid(), signal.SIGINT)
-                    except Exception:
-                        pass
             except Exception:
                 break
 
@@ -282,16 +306,16 @@ def print_run_header(logger: SimpleLogger, config: Config, safe_msg: str) -> Non
 
 
 def process_individual_sequences(
-    sequences: List[SequenceInfo], 
-    config: Config, 
-    logger: SimpleLogger, 
-    stop_ev: threading.Event, 
-    pause_ev: threading.Event, 
-    print_status_fn
-) -> Tuple[int, int, int]:
+    sequences: list[SequenceInfo],
+    config: Config,
+    logger: SimpleLogger,
+    stop_ev: threading.Event,
+    pause_ev: threading.Event,
+    print_status_fn,
+) -> tuple[int, int, int]:
     """Process sequences in individual frame mode."""
     successes = failures = produced_total = 0
-    
+
     for i, seq in enumerate(sequences, 1):
         if stop_ev.is_set():
             break
@@ -304,61 +328,65 @@ def process_individual_sequences(
         logger.info(f"[{i:02d}/{len(sequences)}] INDIV {display_path}{seq.ext} ({len(seq)} frames)")
 
         ok, msg, produced = SequenceProcessor.encode_sequence_individual(
-            seq=seq, out_root=config.output_dir, quality=config.quality, 
-            threads=config.workers, timeout_sec=config.timeout_sec, 
-            fmt=config.format, pad_digits=config.pad_digits
+            seq=seq,
+            out_root=config.output_dir,
+            quality=config.quality,
+            threads=config.workers,
+            timeout_sec=config.timeout_sec,
+            fmt=config.format,
+            pad_digits=config.pad_digits,
         )
         produced_total += produced
-        
+
         if ok:
             logger.success(f"    -> {msg}")
             successes += 1
         else:
             logger.error(f"    -> {msg}")
             failures += 1
-        
+
         # Print status periodically
         if i % STATUS_PRINT_INTERVAL == 0 or i == len(sequences):
             print_status_fn()
-    
+
     return successes, failures, produced_total
 
 
 def process_animated_sequences(
-    sequences: List[SequenceInfo],
+    sequences: list[SequenceInfo],
     config: Config,
     logger: SimpleLogger,
     stop_ev: threading.Event,
     pause_ev: threading.Event,
-    print_status_fn
-) -> Tuple[int, int]:
+    print_status_fn,
+) -> tuple[int, int]:
     """Process sequences in animated mode using process pool."""
     successes = failures = 0
-    
+
     with futures.ProcessPoolExecutor(max_workers=config.workers) as pool:
-        fut_map: Dict[futures.Future, Tuple[int, SequenceInfo, Path]] = {}
-        
+        fut_map: dict[futures.Future, tuple[int, SequenceInfo, Path]] = {}
+
         for i, seq in enumerate(sequences, 1):
             if stop_ev.is_set():
                 break
             while pause_ev.is_set() and not stop_ev.is_set():
                 time.sleep(PAUSE_CHECK_INTERVAL)
-                
+
             out_path = animated_output_path(config.output_dir, seq, config.format)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            
+
             # Read DPI once per sequence and write sidecar JSON next to the animated output target
             try:
                 dpi_info = read_sequence_dpi(seq.frames)
                 write_dpi_json(out_path.with_suffix(out_path.suffix + ".dpi.json"), dpi_dict(dpi_info))
             except Exception:
                 pass
-                
+
             frame_paths = [p.as_posix() for p in seq.frames]
-            
+
             # Detect alpha channel for optimization
             has_alpha = check_alpha_exists(seq.frames[0])
-            
+
             # Skip crop when the first frame has no alpha channel
             if not has_alpha:
                 ow, oh = image_dimensions(seq.frames[0])
@@ -368,10 +396,10 @@ def process_animated_sequences(
             else:
                 # Compute sequence-wide crop
                 cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
-                crop_tuple: Optional[Tuple[int, int, int, int]] = None
+                crop_tuple: tuple[int, int, int, int] | None = None
                 if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
                     crop_tuple = (cx, cy, cw, ch)
-                    
+
             offsets_path = out_path.with_suffix(out_path.suffix + ".json")
             encode_config = AnimatedEncodeConfig(
                 frame_paths=frame_paths,
@@ -383,26 +411,26 @@ def process_animated_sequences(
                 offsets_json=offsets_path.as_posix(),
                 seq_orig_w=ow,
                 seq_orig_h=oh,
-                has_alpha=has_alpha
+                has_alpha=has_alpha,
             )
-            
+
             display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
             logger.info(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} ({len(seq)} frames)")
-            
+
             fut = pool.submit(SequenceProcessor.encode_animated_task, encode_config)
             fut_map[fut] = (i, seq, out_path)
-            
+
         # Collect results
         for fut in futures.as_completed(fut_map.keys(), timeout=config.timeout_sec):
             i, seq, out_path = fut_map[fut]
             display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-            
+
             try:
                 ok, msg, produced = fut.result(timeout=config.timeout_sec)
                 if ok:
                     logger.success(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
                     successes += 1
-                    
+
                     # Try to combine metadata
                     try:
                         metadata_entries = combine_to_metadata(seq.frames, (cx, cy))
@@ -417,7 +445,9 @@ def process_animated_sequences(
             except futures.TimeoutError:
                 failures += 1
                 fut.cancel()
-                logger.error(f"[{i:02d}/{len(sequences)}] TIMEOUT after {config.timeout_sec}s for {display_path}{seq.ext}")
+                logger.error(
+                    f"[{i:02d}/{len(sequences)}] TIMEOUT after {config.timeout_sec}s for {display_path}{seq.ext}"
+                )
             except Exception as ex:
                 failures += 1
                 logger.error(f"[{i:02d}/{len(sequences)}] ERROR on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
@@ -425,11 +455,11 @@ def process_animated_sequences(
                 # Print status periodically
                 if i % STATUS_PRINT_INTERVAL == 0 or i == len(sequences):
                     print_status_fn()
-                    
+
     return successes, failures
 
 
-def main(argv: Optional[Sequence[str]] = None) -> int:
+def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point."""
     args = parse_args(argv)
 
@@ -462,10 +492,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     print_run_header(logger, config, "")
 
     t0 = time.time()
-    sequences = find_sequences(config.base_path)
+    sequences = find_sequences(config.base_path, config.first_frame_only)
     if not sequences:
         logger.warning(f"No numeric sequences (>={MIN_SEQUENCE_FRAMES} frames) found. Nothing to do.")
         return 0
+
+    if config.first_frame_only:
+        logger.info("First-frame-only mode enabled - processing only the first frame of each sequence")
 
     # Print discovered sequences table
     logger.section(f"Discovered {len(sequences)} sequences")
@@ -483,30 +516,29 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     successes = 0
     failures = 0
     produced_total = 0
-    perseq_times: List[float] = []
 
     def print_status():
         total = successes + failures
         elapsed = time.time() - t0
         state = "PAUSED" if pause_ev.is_set() else "running"
-        logger.log(f"Processed: {total}/{len(sequences)} | Success: {successes} | Failed: {failures} | Elapsed: {elapsed:.1f}s | State: {state}")
+        logger.log(
+            f"Processed: {total}/{len(sequences)} | Success: {successes} | Failed: {failures} | Elapsed: {elapsed:.1f}s | State: {state}"
+        )
         logger.log("Controls: 'p' pause/resume | 'q' quit")
 
     try:
         # Start background listener for pause/quit controls
         _ = start_controls_listener(pause_ev, stop_ev)
         logger.info("Processing started. Controls: 'p' pause/resume | 'q' quit")
-        
+
         if config.run_mode is RunMode.INDIVIDUAL:
             successes, failures, produced_total = process_individual_sequences(
                 sequences, config, logger, stop_ev, pause_ev, print_status
             )
         else:
-            successes, failures = process_animated_sequences(
-                sequences, config, logger, stop_ev, pause_ev, print_status
-            )
+            successes, failures = process_animated_sequences(sequences, config, logger, stop_ev, pause_ev, print_status)
 
-    except GracefulExit:
+    except GracefulExitError:
         # Message already printed by signal handler
         pass
     except KeyboardInterrupt:
@@ -526,7 +558,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ]
     if config.run_mode is RunMode.INDIVIDUAL:
         rows.append(["Frames Created:", f"{produced_total:,}"])
-    
+
     for label, value in rows:
         logger.log(f"{label:<20} {value}")
 
