@@ -15,14 +15,15 @@ from pathlib import Path
 import numpy as np
 
 # Cropping constants
-CROP_ALIGNMENT_PIXELS = 256
+CROP_ALIGNMENT_PIXELS = 1
 
 
-def find_transparent_256_crop(alpha: np.ndarray) -> tuple[int, int, int, int]:
+def find_transparent_aligned_crop(alpha: np.ndarray, alignment: int = CROP_ALIGNMENT_PIXELS) -> tuple[int, int, int, int]:
     """Compute crop rectangle by trimming fully-transparent blocks from edges.
 
     Args:
         alpha (np.ndarray): 2D uint8 alpha channel.
+        alignment (int): Pixel alignment for crop boundaries.
 
     Returns:
         Tuple[int, int, int, int]: (x0, y0, x1, y1) crop bounds, half-open.
@@ -31,32 +32,32 @@ def find_transparent_256_crop(alpha: np.ndarray) -> tuple[int, int, int, int]:
     x0, y0, x1, y1 = 0, 0, w, h
 
     # top
-    while (y1 - y0) >= CROP_ALIGNMENT_PIXELS:
-        band = alpha[y0 : y0 + CROP_ALIGNMENT_PIXELS, x0:x1]
+    while (y1 - y0) >= alignment:
+        band = alpha[y0 : y0 + alignment, x0:x1]
         if np.any(band):
             break
-        y0 += CROP_ALIGNMENT_PIXELS
+        y0 += alignment
 
     # bottom
-    while (y1 - y0) >= CROP_ALIGNMENT_PIXELS:
-        band = alpha[y1 - CROP_ALIGNMENT_PIXELS : y1, x0:x1]
+    while (y1 - y0) >= alignment:
+        band = alpha[y1 - alignment : y1, x0:x1]
         if np.any(band):
             break
-        y1 -= CROP_ALIGNMENT_PIXELS
+        y1 -= alignment
 
     # left
-    while (x1 - x0) >= CROP_ALIGNMENT_PIXELS:
-        band = alpha[y0:y1, x0 : x0 + CROP_ALIGNMENT_PIXELS]
+    while (x1 - x0) >= alignment:
+        band = alpha[y0:y1, x0 : x0 + alignment]
         if np.any(band):
             break
-        x0 += CROP_ALIGNMENT_PIXELS
+        x0 += alignment
 
     # right
-    while (x1 - x0) >= CROP_ALIGNMENT_PIXELS:
-        band = alpha[y0:y1, x1 - CROP_ALIGNMENT_PIXELS : x1]
+    while (x1 - x0) >= alignment:
+        band = alpha[y0:y1, x1 - alignment : x1]
         if np.any(band):
             break
-        x1 -= CROP_ALIGNMENT_PIXELS
+        x1 -= alignment
 
     # Ensure valid rectangle
     x0 = max(0, min(x0, w))
@@ -66,11 +67,12 @@ def find_transparent_256_crop(alpha: np.ndarray) -> tuple[int, int, int, int]:
     return x0, y0, x1, y1
 
 
-def compute_256_crop(path: Path) -> tuple[int, int, int, int, int, int]:
+def compute_aligned_crop(path: Path, alignment: int = CROP_ALIGNMENT_PIXELS) -> tuple[int, int, int, int, int, int]:
     """Determine crop rectangle for an image file.
 
     Args:
         path (Path): Image file to analyze.
+        alignment (int): Pixel alignment for crop boundaries.
 
     Returns:
         Tuple[int, int, int, int, int, int]: (crop_x, crop_y, crop_w, crop_h, orig_w, orig_h)
@@ -81,7 +83,7 @@ def compute_256_crop(path: Path) -> tuple[int, int, int, int, int, int]:
     if alpha is None:
         return 0, 0, orig_w, orig_h, orig_w, orig_h
 
-    x0, y0, x1, y1 = find_transparent_256_crop(alpha)
+    x0, y0, x1, y1 = find_transparent_aligned_crop(alpha, alignment)
     return x0, y0, x1 - x0, y1 - y0, orig_w, orig_h
 
 
@@ -164,14 +166,14 @@ def _bounds_from_presence(pres: list[bool], block: int, limit: int) -> tuple[int
     return start, end
 
 
-def compute_sequence_256_crop(
-    paths: Sequence[Path], block: int = CROP_ALIGNMENT_PIXELS
+def compute_sequence_aligned_crop(
+    paths: Sequence[Path], alignment: int = CROP_ALIGNMENT_PIXELS
 ) -> tuple[int, int, int, int, int, int]:
     """Compute crop rectangle for a sequence of images with aligned cropping.
 
     Args:
         paths (Sequence[Path]): Image paths to analyze.
-        block (int): Block size for alignment.
+        alignment (int): Pixel alignment for crop boundaries.
 
     Returns:
         Tuple[int, int, int, int, int, int]: (crop_x, crop_y, crop_w, crop_h, orig_w, orig_h)
@@ -187,19 +189,19 @@ def compute_sequence_256_crop(
         return 0, 0, orig_w, orig_h, orig_w, orig_h
 
     # Initialize presence accumulators
-    x_acc, y_acc = _presence_blocks(alpha, block)
+    x_acc, y_acc = _presence_blocks(alpha, alignment)
 
     # Process remaining frames
     for path in paths[1:]:
         alpha, w, h = read_alpha_channel(path)
         if alpha is None or w != orig_w or h != orig_h:
             continue
-        x_pres, y_pres = _presence_blocks(alpha, block)
+        x_pres, y_pres = _presence_blocks(alpha, alignment)
         x_acc = _combine_presence(x_acc, x_pres)
         y_acc = _combine_presence(y_acc, y_pres)
 
     # Compute final bounds
-    x0, x1 = _bounds_from_presence(x_acc, block, orig_w)
-    y0, y1 = _bounds_from_presence(y_acc, block, orig_h)
+    x0, x1 = _bounds_from_presence(x_acc, alignment, orig_w)
+    y0, y1 = _bounds_from_presence(y_acc, alignment, orig_h)
 
     return x0, y0, x1 - x0, y1 - y0, orig_w, orig_h

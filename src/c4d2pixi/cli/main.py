@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-webpseq: Convert numeric frame sequences to WebP/AVIF (animated or per-frame).
+c4d2pixi: Convert Cinema 4D rendered sequences to WebP/AVIF (animated or per-frame).
 
 This refactor improves readability and separations of concerns by:
 - Introducing enums for output format and run mode
@@ -25,6 +25,7 @@ from pathlib import Path
 
 # Local application imports
 from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
+from ..core.mapping import DirectoryMapper, OutputCategory
 from ..core.types import (
     AnimatedEncodeConfig,
     Config,
@@ -35,7 +36,7 @@ from ..core.types import (
 )
 from ..output.logger import SimpleLogger
 from ..output.persistent import install_persistent_console
-from ..processing.crop import compute_sequence_256_crop
+from ..processing.crop import compute_sequence_aligned_crop
 from ..processing.image import check_alpha_exists, image_dimensions
 from ..processing.sequence import SequenceProcessor
 from ..tools.check import check_tools
@@ -61,7 +62,7 @@ DEFAULT_TIMEOUT_SEC = 300
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     p = argparse.ArgumentParser(
-        prog="webpseq",
+        prog="c4d2pixi",
         description="Convert numeric frame sequences to WebP/AVIF (animated or per-frame).",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
@@ -89,6 +90,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.add_argument("-w", "--max-workers", type=int, help="Max parallel workers (capped at 8)")
     p.add_argument("-s", "--sequential", action="store_true", help="Force sequential processing")
     p.add_argument("--first-frame-only", action="store_true", help="Process only the first frame of each sequence")
+    p.add_argument("--extract-scenes", action="store_true", help="Extract first frame as scene for transitions")
+    p.add_argument("--crop-alignment", type=int, default=256, help="Pixel alignment for crop boundaries (default: 256)")
     p.add_argument("--check-tools", action="store_true", help="Verify external tools and exit")
     return p.parse_args(argv)
 
@@ -111,6 +114,8 @@ def build_config(args: argparse.Namespace) -> Config:
         timeout_sec=DEFAULT_TIMEOUT_SEC,
         pad_digits=args.pad_digits,
         first_frame_only=args.first_frame_only,
+        extract_scenes=args.extract_scenes,
+        crop_alignment=args.crop_alignment,
     )
 
 
@@ -216,15 +221,94 @@ def find_sequences(base_path: Path, first_frame_only: bool = False) -> list[Sequ
 # ------------------------------
 
 
+def extract_scene_from_sequence(
+    seq: SequenceInfo,
+    config: Config,
+    logger: SimpleLogger
+) -> tuple[bool, str]:
+    """
+    Extract the first frame of a sequence as a scene image.
+    Only applies to transition sequences.
+    """
+    # Check if we have a mapping for this directory
+    naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
+
+    if not naming or naming.category != OutputCategory.TRANSITION:
+        # Only extract scenes for transitions
+        return True, "skip non-transition"
+
+    # Get the first frame
+    if not seq.frames:
+        return False, "no frames in sequence"
+
+    first_frame = seq.frames[0]
+
+    # Generate scene output path
+    scene_dir = config.output_dir / "scenes"
+    scene_dir.mkdir(parents=True, exist_ok=True)
+
+    # Extract scene info to create proper scene name
+    scene_info = DirectoryMapper.extract_scene_info(naming)
+    if scene_info:
+        scene_type, time_of_day = scene_info
+        scene_name = f"scene_{scene_type}_{time_of_day}.{config.format.extension}"
+    else:
+        scene_name = naming.format_scene_name(config.format.extension)
+
+    scene_path = scene_dir / scene_name
+
+    # Skip if already exists
+    if scene_path.exists():
+        return True, f"scene exists: {scene_name}"
+
+    # Process the first frame
+    from ..processing.sequence import SequenceProcessor
+
+    # Check for alpha and compute crop if needed
+    has_alpha = check_alpha_exists(first_frame)
+    if not has_alpha:
+        ow, oh = image_dimensions(first_frame)
+        crop_tuple = None
+    else:
+        # For scenes, compute crop just for the first frame
+        cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop([first_frame], config.crop_alignment)
+        crop_tuple = None if (cx == 0 and cy == 0 and cw == ow and ch == oh) else (cx, cy, cw, ch)
+
+    # Encode the frame
+    success, msg = SequenceProcessor.encode_one_frame(
+        first_frame,
+        scene_path,
+        config.quality,
+        config.format,
+        crop_tuple,
+        ow,
+        oh
+    )
+
+    if success:
+        return True, f"extracted scene: {scene_name}"
+    else:
+        return False, f"failed to extract scene: {msg}"
+
+
 def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
     """
-    Place one output file per sequence under output_root mirroring the relative directory.
+    Place one output file per sequence under output_root with new naming convention.
     """
-    # e.g., outputs/webp_renders/<rel_dir>/<prefix_or_dirname>_<ext>.webp
-    rel_target_dir = output_root / seq.rel_dir
-    base_name_str = seq.prefix.strip() or seq.dir_path.name
-    base_name = base_name_str.rstrip("._-")
-    basename = f"{base_name}_{seq.ext.lstrip('.')}.{fmt.extension}"
+    # Check if we have a mapping for this directory
+    naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
+
+    if naming:
+        # Use mapped naming convention
+        rel_target_dir = output_root / naming.category_dir
+        basename = naming.format_animated_name(fmt.extension)
+    else:
+        # Fall back to original naming
+        rel_target_dir = output_root / seq.rel_dir
+        base_name_str = seq.prefix.strip() or seq.dir_path.name
+        base_name = base_name_str.rstrip("._-")
+        basename = f"{base_name}_{seq.ext.lstrip('.')}.{fmt.extension}"
+
     return rel_target_dir / basename
 
 
@@ -395,7 +479,7 @@ def process_animated_sequences(
                 cw, ch = ow, oh
             else:
                 # Compute sequence-wide crop
-                cx, cy, cw, ch, ow, oh = compute_sequence_256_crop(seq.frames)
+                cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop(seq.frames, config.crop_alignment)
                 crop_tuple: tuple[int, int, int, int] | None = None
                 if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
                     crop_tuple = (cx, cy, cw, ch)
@@ -439,6 +523,14 @@ def process_animated_sequences(
                         logger.success("    -> wrote metadata.json")
                     except Exception as ex:
                         logger.warning(f"    -> metadata combine failed: {type(ex).__name__}: {ex}")
+
+                    # Extract scene if requested (for transitions only)
+                    if config.extract_scenes:
+                        scene_ok, scene_msg = extract_scene_from_sequence(seq, config, logger)
+                        if scene_ok and "skip" not in scene_msg:
+                            logger.success(f"    -> {scene_msg}")
+                        elif not scene_ok:
+                            logger.warning(f"    -> {scene_msg}")
                 else:
                     logger.error(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
                     failures += 1

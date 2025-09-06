@@ -1,4 +1,0 @@
-[console_scripts]
-webpseq = ss_image_processor.cli.main:main
-webpseq-metadata = ss_image_processor.cli.metadata:main
-webpseq-viewer = ss_image_processor.cli.viewer:main

@@ -56,7 +56,7 @@ class OutputFormat(Enum):
                     "-c:v",
                     "libaom-av1",
                     "-pix_fmt",
-                    "yuv420p",
+                    "yuv444p",
                     "-cpu-used",
                     "6",
                     "-crf",
@@ -132,12 +132,12 @@ class Quality:
         if fmt is OutputFormat.AVIF:
             # Use libaom-av1 settings; include -b:v 0 for CQ mode and -cpu-used for speed.
             if n == "lossless":
-                return Quality(mode="lossless", ffmpeg_args=["-crf", "0", "-b:v", "0", "-cpu-used", "6"])
+                return Quality(mode="lossless", ffmpeg_args=["-crf", "0", "-b:v", "0", "-cpu-used", "8"])
             mapping = {"high": "23", "medium": "30", "low": "40"}
             if n not in mapping:
                 raise ValueError(f"Unknown quality preset for avif: {name}")
             crf = mapping[n]
-            return Quality(mode=n, ffmpeg_args=["-crf", crf, "-b:v", "0", "-cpu-used", "6"])
+            return Quality(mode=n, ffmpeg_args=["-crf", crf, "-b:v", "0", "-cpu-used", "8"])
         raise ValueError(f"Unknown format for quality settings: {fmt}")
 
 
@@ -168,6 +168,8 @@ class Config:
     timeout_sec: int
     pad_digits: int | None = None
     first_frame_only: bool = False
+    extract_scenes: bool = False
+    crop_alignment: int = 256
 
 
 @dataclass(frozen=True)

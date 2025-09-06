@@ -4,3 +4,10 @@ output/
 .repomap*
 .ropeproject*/**
 node_modules/
+
+/src/c4d_to_pixi_encoder.egg-info/dependency_links.txt
+/src/c4d_to_pixi_encoder.egg-info/entry_points.txt
+/src/c4d_to_pixi_encoder.egg-info/PKG-INFO
+/src/c4d_to_pixi_encoder.egg-info/requires.txt
+/src/c4d_to_pixi_encoder.egg-info/SOURCES.txt
+/src/c4d_to_pixi_encoder.egg-info/top_level.txt

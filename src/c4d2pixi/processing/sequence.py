@@ -15,10 +15,11 @@ import time
 from pathlib import Path
 
 from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
+from ..core.mapping import DirectoryMapper, OutputCategory
 from ..core.types import AnimatedEncodeConfig, OutputFormat, Quality, SequenceInfo
 from ..utils.dpi import dpi_dict, read_sequence_dpi
 from ..utils.subprocess import run_subprocess, write_ffconcat_file
-from .crop import compute_sequence_256_crop
+from .crop import compute_sequence_aligned_crop
 from .ffmpeg import FFmpegCommandBuilder
 from .image import check_alpha_exists, image_dimensions, split_tiff_channels, validate_tiff_file
 
@@ -45,7 +46,7 @@ class SequenceProcessor:
                 size = out.stat().st_size
                 return True, f"SKIP exists: {out.name} ({size} bytes)", size
 
-            with tempfile.TemporaryDirectory(prefix="webpseq_") as td:
+            with tempfile.TemporaryDirectory(prefix="c4d2pixi_") as td:
                 list_file = write_ffconcat_file([Path(p) for p in config.frame_paths], Path(td))
                 cmd = FFmpegCommandBuilder.build_animated_cmd(
                     list_file, out, q, config.threads, fmt, config.crop_rect, config.has_alpha
@@ -197,21 +198,55 @@ class SequenceProcessor:
                     msgs.append(f"EXC {type(ex).__name__}: {ex}")
 
         elapsed = time.time() - start
-        # Write one offsets JSON and one DPI JSON for the entire sequence
-        rel_dir = out_root / INDIVIDUAL_SUBDIR / seq.rel_dir
-        base_name_str = seq.prefix.strip() or seq.dir_path.name
-        base_name = base_name_str.rstrip("._-")
-        json_path = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.json"
-        with contextlib.suppress(Exception):
-            write_offset_json(json_path, cx, cy, cw, ch, ow, oh)
-        # DPI sidecar written once per sequence
-        with contextlib.suppress(Exception):
-            dpi_info = read_sequence_dpi(seq.frames)
-            dpi_sidecar = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.dpi.json"
-            write_dpi_json(dpi_sidecar, dpi_dict(dpi_info))
-        # Combine sidecars into metadata.json per sequence
-        with contextlib.suppress(Exception):
-            combine_to_metadata(rel_dir, f"{base_name}_{seq.ext.lstrip('.')}", output_name="metadata.json")
+        
+        # Get the output naming convention
+        naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
+        
+        if naming:
+            # Use mapped naming convention for metadata
+            rel_dir = out_root / naming.category_dir
+            # Generate a consolidated metadata.json for the category
+            metadata_path = rel_dir / "metadata.json"
+            
+            # Write metadata for this sequence
+            with contextlib.suppress(Exception):
+                # Read existing metadata if it exists
+                metadata = {}
+                if metadata_path.exists():
+                    import json
+                    with open(metadata_path, 'r') as f:
+                        metadata = json.load(f)
+                
+                # Add this sequence's metadata
+                sequence_key = naming.prefix
+                metadata[sequence_key] = {
+                    "offset": {"x": cx, "y": cy},
+                    "dimensions": {"width": cw, "height": ch},
+                    "original": {"width": ow, "height": oh},
+                    "frames": len(seq.frames),
+                    "dpi": dpi_dict(read_sequence_dpi(seq.frames)) if seq.frames else {}
+                }
+                
+                # Write updated metadata
+                import json
+                with open(metadata_path, 'w') as f:
+                    json.dump(metadata, f, indent=2)
+        else:
+            # Fall back to original metadata handling
+            rel_dir = out_root / INDIVIDUAL_SUBDIR / seq.rel_dir
+            base_name_str = seq.prefix.strip() or seq.dir_path.name
+            base_name = base_name_str.rstrip("._-")
+            json_path = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.json"
+            with contextlib.suppress(Exception):
+                write_offset_json(json_path, cx, cy, cw, ch, ow, oh)
+            # DPI sidecar written once per sequence
+            with contextlib.suppress(Exception):
+                dpi_info = read_sequence_dpi(seq.frames)
+                dpi_sidecar = rel_dir / f"{base_name}_{seq.ext.lstrip('.')}.dpi.json"
+                write_dpi_json(dpi_sidecar, dpi_dict(dpi_info))
+            # Combine sidecars into metadata.json per sequence
+            with contextlib.suppress(Exception):
+                combine_to_metadata(rel_dir, f"{base_name}_{seq.ext.lstrip('.')}", output_name="metadata.json")
         return (
             ok,
             f"{produced}/{missing} created in {elapsed:.1f}s; " + " | ".join(itertools.islice(msgs, 0, 8)),
@@ -228,12 +263,34 @@ class SequenceProcessor:
         pad_digits: int | None = None,
     ) -> Path:
         """
-        Place per-frame outputs under:
-          output_root/individual_frames/<rel_dir>/<frame_stem>.<format>
+        Place per-frame outputs using new naming convention.
         """
-        rel_dir = output_root / INDIVIDUAL_SUBDIR / seq.rel_dir
-        if pad_digits and frame_index is not None:
-            name = f"{frame_index:0{pad_digits}d}.{fmt.extension}"
+        # Check if we have a mapping for this directory
+        naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
+        
+        if naming:
+            # Use mapped naming convention
+            rel_dir = output_root / naming.category_dir
+            # For individual frames, use frame index starting from 0
+            if frame_index is not None:
+                # Convert 1-based index to 0-based for output
+                zero_based_index = frame_index - 1
+                name = naming.format_frame_name(zero_based_index, fmt.extension)
+            else:
+                # Extract frame number from filename
+                import re
+                match = re.search(r'(\d+)', frame.stem)
+                if match:
+                    frame_num = int(match.group(1))
+                    name = naming.format_frame_name(frame_num, fmt.extension)
+                else:
+                    name = f"{frame.stem}.{fmt.extension}"
         else:
-            name = f"{frame.stem}.{fmt.extension}"
+            # Fall back to original naming
+            rel_dir = output_root / INDIVIDUAL_SUBDIR / seq.rel_dir
+            if pad_digits and frame_index is not None:
+                name = f"{frame_index:0{pad_digits}d}.{fmt.extension}"
+            else:
+                name = f"{frame.stem}.{fmt.extension}"
+        
         return rel_dir / name
