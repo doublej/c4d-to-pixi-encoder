@@ -10,9 +10,9 @@ dependencies = [
 ]
 
 [project.scripts]
-webpseq = "ss_image_processor.cli.main:main"
-webpseq-viewer = "ss_image_processor.cli.viewer:main"
-webpseq-metadata = "ss_image_processor.cli.metadata:main"
+c4d2pixi = "ss_image_processor.cli.main:main"
+c4d2pixi-viewer = "ss_image_processor.cli.viewer:main"
+c4d2pixi-metadata = "ss_image_processor.cli.metadata:main"
 
 [project.optional-dependencies]
 dev = [

@@ -40,19 +40,19 @@ uv pip install -e .
 
 ```bash
 # Convert all sequences to animated WebP (default)
-uv run webpseq
+uv run c4d2pixi
 
 # Convert to AVIF format with high quality
-uv run webpseq --format avif -q high
+uv run c4d2pixi --format avif -q high
 
 # Export individual frames instead of animated
-uv run webpseq -i --format webp
+uv run c4d2pixi -i --format webp
 ```
 
 ### Command-Line Options
 
 ```bash
-uv run webpseq [OPTIONS]
+uv run c4d2pixi [OPTIONS]
 ```
 
 | Option | Description | Default |
@@ -73,40 +73,40 @@ uv run webpseq [OPTIONS]
 #### Convert to Animated WebP
 ```bash
 # High quality animated WebP (default)
-uv run webpseq /path/to/frames
+uv run c4d2pixi /path/to/frames
 
 # Medium quality for smaller files
-uv run webpseq -q medium /path/to/frames
+uv run c4d2pixi -q medium /path/to/frames
 
 # Lossless WebP (large files)
-uv run webpseq -q lossless /path/to/frames
+uv run c4d2pixi -q lossless /path/to/frames
 ```
 
 #### Convert to AVIF
 ```bash
 # Animated AVIF with automatic alpha optimization
-uv run webpseq --format avif /path/to/frames
+uv run c4d2pixi --format avif /path/to/frames
 
 # Individual AVIF frames with cropping
-uv run webpseq -i --format avif --crop /path/to/frames
+uv run c4d2pixi -i --format avif --crop /path/to/frames
 ```
 
 #### Individual Frame Export
 ```bash
 # Export each frame as individual WebP
-uv run webpseq -i /path/to/frames
+uv run c4d2pixi -i /path/to/frames
 
 # With custom padding (e.g., frame_00001.webp)
-uv run webpseq -i --pad-digits 5 /path/to/frames
+uv run c4d2pixi -i --pad-digits 5 /path/to/frames
 ```
 
 #### Quick Testing
 ```bash
 # Process only first frame of each sequence (fast preview)
-uv run webpseq --first-frame-only /path/to/frames
+uv run c4d2pixi --first-frame-only /path/to/frames
 
 # Check if FFmpeg is properly installed
-uv run webpseq --check-tools
+uv run c4d2pixi --check-tools
 ```
 
 ## Project Structure
@@ -206,7 +206,7 @@ uv run pytest tests/test_alpha_exists.py
 ### FFmpeg Not Found
 ```bash
 # Check if FFmpeg is installed
-uv run webpseq --check-tools
+uv run c4d2pixi --check-tools
 
 # Install FFmpeg (macOS)
 brew install ffmpeg
