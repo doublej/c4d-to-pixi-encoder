@@ -493,6 +493,22 @@ def process_individual_sequences(
         if ok:
             logger.success(f"    -> {msg}")
             successes += 1
+            
+            # Extract scene if requested (for transitions only)
+            if config.extract_scenes:
+                scene_ok, scene_msg = extract_scene_from_sequence(seq, config, logger)
+                if scene_ok and "skip" not in scene_msg:
+                    logger.success(f"    -> {scene_msg}")
+                elif not scene_ok:
+                    logger.warning(f"    -> {scene_msg}")
+            
+            # Extract room still for transitions (works with first_frame_only too)
+            if config.extract_room_stills:
+                room_ok, room_msg = extract_room_still_from_sequence(seq, config, logger)
+                if room_ok and "skip" not in room_msg:
+                    logger.success(f"    -> {room_msg}")
+                elif not room_ok:
+                    logger.warning(f"    -> {room_msg}")
         else:
             logger.error(f"    -> {msg}")
             failures += 1
