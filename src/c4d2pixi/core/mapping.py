@@ -92,25 +92,34 @@ class OutputNaming:
             scene_name = f"scene_{parts[1]}" if len(parts) > 1 else "scene_unknown"
         return f"{scene_name}.{extension}"
     
-    def get_room_still_name(self, extension: str) -> str | None:
+    def get_room_still_name(self, extension: str, frame_position: str = "first") -> str | None:
         """
-        For place-to-place transitions, extract the room name (first location).
+        For place-to-place transitions, extract the room name.
+        
+        Args:
+            extension: File extension for the output
+            frame_position: "first" for starting room, "last" for destination room
+            
         Returns the room still filename or None if not a transition.
         """
         if self.category != OutputCategory.TRANSITION:
             return None
         
-        # Parse the transition name to extract the first room
+        # Parse the transition name to extract rooms
         parts = self.prefix.split('_')
         if len(parts) >= 3:
             # Format is transition_place1-place2_timeofday
             transition_name = parts[1]  # e.g., "seat-coll"
             time_of_day = parts[2]  # e.g., "day"
             
-            # Extract first place from transition name
+            # Extract places from transition name
             if '-' in transition_name:
-                first_place = transition_name.split('-')[0]  # e.g., "seat"
-                return f"room_{first_place}_{time_of_day}.{extension}"
+                places = transition_name.split('-')
+                if frame_position == "first":
+                    place = places[0]  # e.g., "seat"
+                else:  # "last"
+                    place = places[1]  # e.g., "coll" or "turn"
+                return f"room_{place}_{time_of_day}.{extension}"
         
         return None
 

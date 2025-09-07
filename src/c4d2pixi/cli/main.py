@@ -293,11 +293,13 @@ def extract_scene_from_sequence(
 def extract_room_still_from_sequence(
     seq: SequenceInfo,
     config: Config,
-    logger: SimpleLogger
+    logger: SimpleLogger,
+    extract_both_ends: bool = True
 ) -> tuple[bool, str]:
     """
-    Extract the first frame of a place-to-place transition as a room still.
+    Extract room stills from a place-to-place transition.
     The first frame represents the starting room.
+    The last frame represents the destination room.
     """
     # Check if we have a mapping for this directory
     naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
@@ -305,57 +307,70 @@ def extract_room_still_from_sequence(
     if not naming:
         return True, "skip unmapped"
 
-    # Get the room still name (only for transitions)
-    room_still_name = naming.get_room_still_name(config.format.extension)
-    if not room_still_name:
-        # Not a transition or couldn't extract room name
+    # Process both first and last frames for transitions
+    results = []
+    frames_to_extract = [
+        ("first", seq.frames[0] if seq.frames else None),
+    ]
+    
+    # Add last frame if we want both ends and have multiple frames
+    if extract_both_ends and len(seq.frames) > 1:
+        frames_to_extract.append(("last", seq.frames[-1]))
+    
+    for position, frame in frames_to_extract:
+        if not frame:
+            continue
+            
+        # Get the room still name for this position
+        room_still_name = naming.get_room_still_name(config.format.extension, position)
+        if not room_still_name:
+            # Not a transition or couldn't extract room name
+            continue
+
+        # Generate room still output path
+        room_dir = config.output_dir / "room_stills"
+        room_dir.mkdir(parents=True, exist_ok=True)
+
+        room_path = room_dir / room_still_name
+
+        # Skip if already exists
+        if room_path.exists():
+            results.append(f"exists: {room_still_name}")
+            continue
+
+        # Process the frame
+        from ..processing.sequence import SequenceProcessor
+
+        # Check for alpha and compute crop if needed
+        has_alpha = check_alpha_exists(frame)
+        if not has_alpha:
+            ow, oh = image_dimensions(frame)
+            crop_tuple = None
+        else:
+            # For room stills, compute crop just for this frame
+            cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop([frame], config.crop_alignment)
+            crop_tuple = None if (cx == 0 and cy == 0 and cw == ow and ch == oh) else (cx, cy, cw, ch)
+
+        # Encode the frame
+        success, msg = SequenceProcessor.encode_one_frame(
+            frame,
+            room_path,
+            config.quality,
+            config.format,
+            crop_tuple,
+            ow,
+            oh
+        )
+
+        if success:
+            results.append(f"extracted: {room_still_name}")
+        else:
+            return False, f"failed to extract room still: {msg}"
+    
+    if results:
+        return True, "; ".join(results)
+    else:
         return True, "skip non-transition"
-
-    # Get the first frame
-    if not seq.frames:
-        return False, "no frames in sequence"
-
-    first_frame = seq.frames[0]
-
-    # Generate room still output path
-    room_dir = config.output_dir / "room_stills"
-    room_dir.mkdir(parents=True, exist_ok=True)
-
-    room_path = room_dir / room_still_name
-
-    # Skip if already exists
-    if room_path.exists():
-        return True, f"room still exists: {room_still_name}"
-
-    # Process the first frame
-    from ..processing.sequence import SequenceProcessor
-
-    # Check for alpha and compute crop if needed
-    has_alpha = check_alpha_exists(first_frame)
-    if not has_alpha:
-        ow, oh = image_dimensions(first_frame)
-        crop_tuple = None
-    else:
-        # For room stills, compute crop just for the first frame
-        cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop([first_frame], config.crop_alignment)
-        crop_tuple = None if (cx == 0 and cy == 0 and cw == ow and ch == oh) else (cx, cy, cw, ch)
-
-    # Encode the frame
-    success, msg = SequenceProcessor.encode_one_frame(
-        first_frame,
-        room_path,
-        config.quality,
-        config.format,
-        crop_tuple,
-        ow,
-        oh
-    )
-
-    if success:
-        logger.success(f"Extracted room still: {room_still_name}")
-        return True, f"extracted room still: {room_still_name}"
-    else:
-        return False, f"failed to extract room still: {msg}"
 
 
 def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
