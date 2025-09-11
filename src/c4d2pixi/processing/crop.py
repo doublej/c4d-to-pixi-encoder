@@ -14,11 +14,7 @@ from pathlib import Path
 
 import numpy as np
 
-# Cropping constants
-CROP_ALIGNMENT_PIXELS = 1
-
-
-def find_transparent_aligned_crop(alpha: np.ndarray, alignment: int = CROP_ALIGNMENT_PIXELS) -> tuple[int, int, int, int]:
+def find_transparent_aligned_crop(alpha: np.ndarray, alignment: int) -> tuple[int, int, int, int]:
     """Compute crop rectangle by trimming fully-transparent blocks from edges.
 
     Args:
@@ -67,7 +63,7 @@ def find_transparent_aligned_crop(alpha: np.ndarray, alignment: int = CROP_ALIGN
     return x0, y0, x1, y1
 
 
-def compute_aligned_crop(path: Path, alignment: int = CROP_ALIGNMENT_PIXELS) -> tuple[int, int, int, int, int, int]:
+def compute_aligned_crop(path: Path, alignment: int) -> tuple[int, int, int, int, int, int]:
     """Determine crop rectangle for an image file.
 
     Args:
@@ -167,7 +163,7 @@ def _bounds_from_presence(pres: list[bool], block: int, limit: int) -> tuple[int
 
 
 def compute_sequence_aligned_crop(
-    paths: Sequence[Path], alignment: int = CROP_ALIGNMENT_PIXELS
+    paths: Sequence[Path], alignment: int
 ) -> tuple[int, int, int, int, int, int]:
     """Compute crop rectangle for a sequence of images with aligned cropping.
 

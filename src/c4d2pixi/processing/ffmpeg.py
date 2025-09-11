@@ -9,54 +9,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..config import DEFAULT_FRAME_RATE, OutputFormat, Quality
+from ..config import OutputFormat, Quality
 from .image import check_alpha_tiff
 
 
 class FFmpegCommandBuilder:
     """Builder class for constructing FFmpeg commands."""
 
-    @staticmethod
-    def build_animated_cmd(
-        list_file: Path,
-        out_path: Path,
-        quality: Quality,
-        threads: int,
-        fmt: OutputFormat,
-        crop_rect: tuple[int, int, int, int] | None = None,
-        has_alpha: bool = True,
-    ) -> list[str]:
-        """Create ffmpeg command for an animated image sequence, with optional crop and alpha optimization."""
-        base = [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-nostdin",
-            "-f",
-            "concat",
-            "-safe",
-            "0",
-            "-i",
-            str(list_file),
-            "-an",
-            "-vsync",
-            "0",
-            "-r",
-            str(DEFAULT_FRAME_RATE),
-        ]
-        codec_args = fmt.animated_codec_args(threads, has_alpha)
-        if crop_rect is not None:
-            args = codec_args.copy()
-            if "-vf" in args:
-                i = args.index("-vf")
-                if i + 1 < len(args):
-                    existing = args[i + 1]
-                    x, y, w, h = crop_rect
-                    crop = f"crop={w}:{h}:{x}:{y}"
-                    args[i + 1] = f"{crop},{existing}"
-                    codec_args = args
-        return base + codec_args + quality.ffmpeg_args + [str(out_path)]
 
     @staticmethod
     def build_individual_cmd(

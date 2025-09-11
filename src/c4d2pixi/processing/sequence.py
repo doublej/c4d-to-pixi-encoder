@@ -1,8 +1,8 @@
 """
 Sequence processing module for SS Image Processor.
 
-This module handles the encoding of image sequences into WebP/AVIF formats,
-both for individual frames and animated sequences.
+This module handles the encoding of image sequences into WebP/AVIF formats
+for individual frames.
 """
 
 from __future__ import annotations
@@ -10,15 +10,14 @@ from __future__ import annotations
 import concurrent.futures as futures
 import contextlib
 import itertools
-import tempfile
 import time
 from pathlib import Path
 
 from ..cli.metadata import combine_to_metadata, write_dpi_json, write_offset_json
-from ..config import AnimatedEncodeConfig, OutputFormat, Quality, SequenceInfo
+from ..config import OutputFormat, Quality, SequenceInfo
 from ..core.mapping import DirectoryMapper
 from ..utils.dpi import dpi_dict, read_sequence_dpi
-from ..utils.subprocess import run_subprocess, write_ffconcat_file
+from ..utils.subprocess import run_subprocess
 from .crop import compute_sequence_aligned_crop
 from .ffmpeg import FFmpegCommandBuilder
 from .image import check_alpha_exists, image_dimensions, split_tiff_channels, validate_tiff_file
@@ -29,47 +28,6 @@ INDIVIDUAL_SUBDIR = Path("individual_frames")
 class SequenceProcessor:
     """Processor for encoding image sequences."""
 
-    @staticmethod
-    def encode_animated_task(config: AnimatedEncodeConfig) -> tuple[bool, str, int | None]:
-        """
-        Child-process-safe function to encode one sequence to an animated image.
-        Returns (success, message, output_size_bytes|None).
-        """
-        try:
-            fmt = OutputFormat(config.format_value)
-            q = Quality.from_name(config.quality_mode, fmt)
-            out = Path(config.out_path)
-            out.parent.mkdir(parents=True, exist_ok=True)
-
-            # Reuse if exists
-            if out.exists():
-                size = out.stat().st_size
-                return True, f"SKIP exists: {out.name} ({size} bytes)", size
-
-            with tempfile.TemporaryDirectory(prefix="c4d2pixi_") as td:
-                list_file = write_ffconcat_file([Path(p) for p in config.frame_paths], Path(td))
-                cmd = FFmpegCommandBuilder.build_animated_cmd(
-                    list_file, out, q, config.threads, fmt, config.crop_rect, config.has_alpha
-                )
-                # Avoid printing from subprocess; parent logs the command via returned message
-                code, pretty = run_subprocess(cmd, log=False)
-                if code != 0:
-                    return False, f"ffmpeg failed: {pretty}", None
-
-            size = out.stat().st_size if out.exists() else None
-            # Optionally write offsets JSON next to the animated output
-            if config.offsets_json and config.seq_orig_w is not None and config.seq_orig_h is not None:
-                if config.crop_rect is not None:
-                    cx, cy, cw, ch = config.crop_rect
-                else:
-                    cx = cy = 0
-                    cw = config.seq_orig_w
-                    ch = config.seq_orig_h
-                write_offset_json(Path(config.offsets_json), cx, cy, cw, ch, config.seq_orig_w, config.seq_orig_h)
-            # Include the command string in success message for visibility in parent logs
-            return True, f"DONE: {out.name} ({size} bytes) | cmd: {pretty}", size
-        except Exception as ex:
-            return False, f"Exception: {type(ex).__name__}: {ex}", None
 
     @staticmethod
     def encode_one_frame(

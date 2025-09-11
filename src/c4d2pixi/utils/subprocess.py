@@ -27,28 +27,4 @@ def run_subprocess(cmd: list[str], *, log: bool = True, timeout: int | None = No
         return -1, str(e)
 
 
-def write_ffconcat_file(frame_paths: list[Path], target_dir: Path) -> Path:
-    """Write FFmpeg concat demuxer file for frame sequence.
 
-    Args:
-        frame_paths: List of frame paths in order
-        target_dir: Directory to write concat file
-
-    Returns:
-        Path to created concat file
-    """
-    concat_path = target_dir / "input.ffconcat"
-
-    with open(concat_path, "w") as f:
-        f.write("ffconcat version 1.0\n")
-        for frame_path in frame_paths:
-            escaped = str(frame_path).replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-            f.write("duration 0.033\n")  # 30fps default
-
-        # Repeat last frame for duration
-        if frame_paths:
-            escaped = str(frame_paths[-1]).replace("'", "'\\''")
-            f.write(f"file '{escaped}'\n")
-
-    return concat_path

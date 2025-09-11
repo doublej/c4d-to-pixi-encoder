@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-c4d2pixi: Convert Cinema 4D rendered sequences to WebP/AVIF (animated or per-frame).
+c4d2pixi: Convert Cinema 4D rendered sequences to WebP/AVIF per-frame.
 
 This refactor improves readability and separations of concerns by:
 - Introducing enums for output format and run mode
@@ -13,7 +13,6 @@ from __future__ import annotations
 
 # Standard library imports
 import argparse
-import concurrent.futures as futures
 import contextlib
 import os
 import signal
@@ -29,11 +28,9 @@ from ..config import (
     MIN_SEQUENCE_FRAMES,
     PAUSE_CHECK_INTERVAL,
     STATUS_PRINT_INTERVAL,
-    AnimatedEncodeConfig,
     Config,
     OutputFormat,
     Quality,
-    RunMode,
     SequenceInfo,
 )
 from ..core.mapping import DirectoryMapper, OutputCategory
@@ -60,7 +57,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     """Parse CLI arguments."""
     p = argparse.ArgumentParser(
         prog="c4d2pixi",
-        description="Convert numeric frame sequences to WebP/AVIF (animated or per-frame).",
+        description="Convert numeric frame sequences to WebP/AVIF per-frame.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("-p", "--base-path", type=Path, default=Path("."), help="Base path to scan")
@@ -70,9 +67,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument(
         "--format", choices=[f.value for f in OutputFormat], default=OutputFormat.WEBP.value, help="Output format"
-    )
-    p.add_argument(
-        "-i", "--individual-frames", action="store_true", help="Export individual files per frame instead of animated"
     )
     p.add_argument(
         "--pad-digits",
@@ -101,13 +95,11 @@ def build_config(args: argparse.Namespace) -> Config:
     workers = pick_worker_count(args.max_workers, args.sequential)
     base_path = args.base_path
     output_dir = args.output_dir or Path("outputs") / f"{fmt.value}_renders"
-    run_mode = RunMode.INDIVIDUAL if args.individual_frames else RunMode.ANIMATED
     return Config(
         base_path=base_path,
         output_dir=output_dir,
         format=fmt,
         quality=quality,
-        run_mode=run_mode,
         workers=workers,
         timeout_sec=DEFAULT_TIMEOUT_SEC,
         pad_digits=args.pad_digits,
@@ -373,25 +365,6 @@ def extract_room_still_from_sequence(
         return True, "skip non-transition"
 
 
-def animated_output_path(output_root: Path, seq: SequenceInfo, fmt: OutputFormat) -> Path:
-    """
-    Place one output file per sequence under output_root with new naming convention.
-    """
-    # Check if we have a mapping for this directory
-    naming = DirectoryMapper.get_output_naming(seq.rel_dir, seq.prefix)
-
-    if naming:
-        # Use mapped naming convention
-        rel_target_dir = output_root / naming.category_dir
-        basename = naming.format_animated_name(fmt.extension)
-    else:
-        # Fall back to original naming
-        rel_target_dir = output_root / seq.rel_dir
-        base_name_str = seq.prefix.strip() or seq.dir_path.name
-        base_name = base_name_str.rstrip("._-")
-        basename = f"{base_name}_{seq.ext.lstrip('.')}.{fmt.extension}"
-
-    return rel_target_dir / basename
 
 
 # ------------------------------
@@ -463,7 +436,7 @@ def print_run_header(logger: SimpleLogger, config: Config, safe_msg: str) -> Non
         ["Output:", str(config.output_dir.resolve())],
         ["Safety:", safe_msg or "ok"],
         ["Format:", config.format.value.upper()],
-        ["Mode:", "individual-frames" if config.run_mode is RunMode.INDIVIDUAL else "animated"],
+        ["Mode:", "individual-frames"],
         ["Quality:", config.quality.mode],
         ["Workers:", f"{config.workers} (cap {MAX_WORKER_CAP})"],
     ]
@@ -535,127 +508,6 @@ def process_individual_sequences(
     return successes, failures, produced_total
 
 
-def process_animated_sequences(
-    sequences: list[SequenceInfo],
-    config: Config,
-    logger: SimpleLogger,
-    stop_ev: threading.Event,
-    pause_ev: threading.Event,
-    print_status_fn,
-) -> tuple[int, int]:
-    """Process sequences in animated mode using process pool."""
-    successes = failures = 0
-
-    with futures.ProcessPoolExecutor(max_workers=config.workers) as pool:
-        fut_map: dict[futures.Future, tuple[int, SequenceInfo, Path]] = {}
-
-        for i, seq in enumerate(sequences, 1):
-            if stop_ev.is_set():
-                break
-            while pause_ev.is_set() and not stop_ev.is_set():
-                time.sleep(PAUSE_CHECK_INTERVAL)
-
-            out_path = animated_output_path(config.output_dir, seq, config.format)
-            out_path.parent.mkdir(parents=True, exist_ok=True)
-
-            # Read DPI once per sequence and write sidecar JSON next to the animated output target
-            try:
-                dpi_info = read_sequence_dpi(seq.frames)
-                write_dpi_json(out_path.with_suffix(out_path.suffix + ".dpi.json"), dpi_dict(dpi_info))
-            except Exception:
-                pass
-
-            frame_paths = [p.as_posix() for p in seq.frames]
-
-            # Detect alpha channel for optimization
-            has_alpha = check_alpha_exists(seq.frames[0])
-
-            # Skip crop when the first frame has no alpha channel
-            if not has_alpha:
-                ow, oh = image_dimensions(seq.frames[0])
-                crop_tuple = None
-                cx = cy = 0
-                cw, ch = ow, oh
-            else:
-                # Compute sequence-wide crop
-                cx, cy, cw, ch, ow, oh = compute_sequence_aligned_crop(seq.frames, config.crop_alignment)
-                crop_tuple: tuple[int, int, int, int] | None = None
-                if not (cx == 0 and cy == 0 and cw == ow and ch == oh):
-                    crop_tuple = (cx, cy, cw, ch)
-
-            offsets_path = out_path.with_suffix(out_path.suffix + ".json")
-            encode_config = AnimatedEncodeConfig(
-                frame_paths=frame_paths,
-                out_path=out_path.as_posix(),
-                quality_mode=config.quality.mode,
-                threads=max(1, config.workers),
-                format_value=config.format.value,
-                crop_rect=crop_tuple,
-                offsets_json=offsets_path.as_posix(),
-                seq_orig_w=ow,
-                seq_orig_h=oh,
-                has_alpha=has_alpha,
-            )
-
-            display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-            logger.info(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} ({len(seq)} frames)")
-
-            fut = pool.submit(SequenceProcessor.encode_animated_task, encode_config)
-            fut_map[fut] = (i, seq, out_path)
-
-        # Collect results
-        for fut in futures.as_completed(fut_map.keys(), timeout=config.timeout_sec):
-            i, seq, out_path = fut_map[fut]
-            display_path = (seq.rel_dir.as_posix() or ".") + f"/{seq.prefix}*"
-
-            try:
-                ok, msg, produced = fut.result(timeout=config.timeout_sec)
-                if ok:
-                    logger.success(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
-                    successes += 1
-
-                    # Try to combine metadata
-                    try:
-                        metadata_entries = combine_to_metadata(seq.frames, (cx, cy))
-                        json_path = out_path.with_suffix(out_path.suffix + ".json")
-                        write_offset_json(json_path, metadata_entries)
-                        logger.success("    -> wrote metadata.json")
-                    except Exception as ex:
-                        logger.warning(f"    -> metadata combine failed: {type(ex).__name__}: {ex}")
-
-                    # Extract scene if requested (for transitions only)
-                    if config.extract_scenes:
-                        scene_ok, scene_msg = extract_scene_from_sequence(seq, config, logger)
-                        if scene_ok and "skip" not in scene_msg:
-                            logger.success(f"    -> {scene_msg}")
-                        elif not scene_ok:
-                            logger.warning(f"    -> {scene_msg}")
-                    
-                    # Extract room still for transitions
-                    if config.extract_room_stills:
-                        room_ok, room_msg = extract_room_still_from_sequence(seq, config, logger)
-                        if room_ok and "skip" not in room_msg:
-                            logger.success(f"    -> {room_msg}")
-                        elif not room_ok:
-                            logger.warning(f"    -> {room_msg}")
-                else:
-                    logger.error(f"[{i:02d}/{len(sequences)}] ANIM {display_path}{seq.ext} -> {msg}")
-                    failures += 1
-            except futures.TimeoutError:
-                failures += 1
-                fut.cancel()
-                logger.error(
-                    f"[{i:02d}/{len(sequences)}] TIMEOUT after {config.timeout_sec}s for {display_path}{seq.ext}"
-                )
-            except Exception as ex:
-                failures += 1
-                logger.error(f"[{i:02d}/{len(sequences)}] ERROR on {display_path}{seq.ext}: {type(ex).__name__}: {ex}")
-            finally:
-                # Print status periodically
-                if i % STATUS_PRINT_INTERVAL == 0 or i == len(sequences):
-                    print_status_fn()
-
-    return successes, failures
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -730,12 +582,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         _ = start_controls_listener(pause_ev, stop_ev)
         logger.info("Processing started. Controls: 'p' pause/resume | 'q' quit")
 
-        if config.run_mode is RunMode.INDIVIDUAL:
-            successes, failures, produced_total = process_individual_sequences(
-                sequences, config, logger, stop_ev, pause_ev, print_status
-            )
-        else:
-            successes, failures = process_animated_sequences(sequences, config, logger, stop_ev, pause_ev, print_status)
+        successes, failures, produced_total = process_individual_sequences(
+            sequences, config, logger, stop_ev, pause_ev, print_status
+        )
 
     except GracefulExitError:
         # Message already printed by signal handler
@@ -755,8 +604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         ["Total Time:", f"{total_time:.1f}s"],
         ["Avg Time/Seq:", f"{avg:.1f}s"],
     ]
-    if config.run_mode is RunMode.INDIVIDUAL:
-        rows.append(["Frames Created:", f"{produced_total:,}"])
+    rows.append(["Frames Created:", f"{produced_total:,}"])
 
     for label, value in rows:
         logger.log(f"{label:<20} {value}")

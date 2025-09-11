@@ -151,37 +151,6 @@ class OutputFormat(str, Enum):
         """File extension for outputs."""
         return self.value
 
-    def animated_codec_args(self, threads: int, has_alpha: bool = True) -> list[str]:
-        """FFmpeg codec arguments for animated outputs with optional alpha optimization."""
-        if self == OutputFormat.WEBP:
-            return [
-                "-c:v", "libwebp",
-                "-loop", "0",
-                "-vf", "format=rgba",
-                "-pix_fmt", "yuva420p",
-                "-threads", str(max(1, threads)),
-            ]
-
-        if self == OutputFormat.AVIF:
-            if has_alpha:
-                return [
-                    "-c:v", "libaom-av1",
-                    "-vf", "format=rgba",
-                    "-pix_fmt", "yuva444p",
-                    "-threads", str(max(1, threads)),
-                ]
-            else:
-                # Optimized non-alpha settings: aomav1_crf30_s6_420p_aqmode1
-                return [
-                    "-c:v", "libaom-av1",
-                    "-pix_fmt", "yuv444p",
-                    "-cpu-used", "6",
-                    "-crf", "30",
-                    "-aq-mode", "1",
-                    "-threads", str(max(1, threads)),
-                ]
-
-        raise ValueError(f"Unsupported OutputFormat: {self}")
 
     def still_codec_args(self, has_alpha: bool = True) -> list[str]:
         """FFmpeg codec arguments for still-frame outputs with optional alpha optimization."""
@@ -197,12 +166,11 @@ class OutputFormat(str, Enum):
                     "-still-picture", "1",
                 ]
             else:
-                # Optimized non-alpha settings: aomav1_crf30_s6_420p_aqmode1
+                # Optimized non-alpha settings: aomav1_s6_420p_aqmode1
                 return [
                     "-c:v", "libaom-av1",
                     "-pix_fmt", "yuv420p",
                     "-cpu-used", "6",
-                    "-crf", "30",
                     "-aq-mode", "1",
                     "-still-picture", "1",
                 ]
@@ -210,15 +178,6 @@ class OutputFormat(str, Enum):
         raise ValueError(f"Unsupported OutputFormat: {self}")
 
 
-# =============================================================================
-# RUN MODE ENUM
-# =============================================================================
-
-class RunMode(str, Enum):
-    """Processing mode: animated or individual frames."""
-
-    ANIMATED = "animated"
-    INDIVIDUAL = "individual"
 
 
 # =============================================================================
@@ -293,28 +252,6 @@ class Quality(BaseModel):
         raise ValueError(f"Unknown format for quality settings: {fmt}")
 
 
-# =============================================================================
-# CODEC SETTINGS
-# =============================================================================
-
-class CodecSettings(BaseModel):
-    """Centralized codec configuration for different output formats."""
-
-    webp_animated_base: list[str] = ["-c:v", "libwebp", "-loop", "0"]
-    webp_still_base: list[str] = ["-c:v", "libwebp"]
-    webp_pixel_format: str = "yuva420p"
-
-    avif_animated_base: list[str] = ["-c:v", "libaom-av1"]
-    avif_still_base: list[str] = ["-c:v", "libaom-av1", "-still-picture", "1"]
-    avif_alpha_pixel_format: str = "yuva444p"
-    avif_no_alpha_pixel_format: str = "yuv444p"
-
-    # AVIF optimization settings for non-alpha content
-    avif_no_alpha_optimized: dict[str, str] = {
-        "cpu_used": "6",
-        "crf": "30",
-        "aq_mode": "1"
-    }
 
 
 # =============================================================================
@@ -362,7 +299,6 @@ class Config(BaseModel):
     output_dir: Path
     format: OutputFormat
     quality: Quality
-    run_mode: RunMode
     workers: Annotated[int, Field(ge=1, le=32)]
     timeout_sec: Annotated[int, Field(gt=0)]
 
@@ -393,44 +329,7 @@ class Config(BaseModel):
         return v
 
 
-class AnimatedEncodeConfig(BaseModel):
-    """Configuration for animated sequence encoding operations."""
 
-    frame_paths: list[str]
-    out_path: str
-    quality_mode: str
-    threads: Annotated[int, Field(ge=1, le=32)]
-    format_value: str
-
-    # Optional parameters
-    crop_rect: tuple[int, int, int, int] | None = None
-    offsets_json: str | None = None
-    seq_orig_w: int | None = None
-    seq_orig_h: int | None = None
-    has_alpha: bool = True
-
-    class Config:
-        frozen = True
-
-    @field_validator('frame_paths')
-    @classmethod
-    def validate_frame_paths_not_empty(cls, v):
-        """Ensure frame paths list is not empty."""
-        if not v:
-            raise ValueError("frame_paths cannot be empty")
-        return v
-
-    @field_validator('crop_rect')
-    @classmethod
-    def validate_crop_rect(cls, v):
-        """Validate crop rectangle dimensions."""
-        if v is not None:
-            x, y, w, h = v
-            if w <= 0 or h <= 0:
-                raise ValueError(f"Crop dimensions must be positive: width={w}, height={h}")
-            if x < 0 or y < 0:
-                raise ValueError(f"Crop coordinates must be non-negative: x={x}, y={y}")
-        return v
 
 
 # =============================================================================
@@ -451,7 +350,6 @@ class AppConfig(BaseSettings):
     image: ImageSettings = ImageSettings()
     worker: WorkerSettings = WorkerSettings()
     file_extensions: FileExtensions = FileExtensions()
-    codec: CodecSettings = CodecSettings()
 
     class Config:
         env_prefix = "C4D2PIXI_"
@@ -486,7 +384,6 @@ app_config = AppConfig()
 STATUS_PRINT_INTERVAL = app_config.time.status_print_interval
 PAUSE_CHECK_INTERVAL = app_config.time.pause_check_interval
 MIN_SEQUENCE_FRAMES = app_config.sequence.min_sequence_frames
-DEFAULT_FRAME_RATE = app_config.sequence.default_frame_rate
 DEFAULT_DPI = app_config.image.default_dpi
 CROP_ALIGNMENT_PIXELS = app_config.image.crop_alignment_pixels
 MIN_ALPHA_CHANNELS = app_config.image.min_alpha_channels
@@ -509,6 +406,3 @@ def get_quality_preset(name: str, format_type: OutputFormat) -> Quality:
     """Get quality preset for given name and format."""
     return Quality.from_name(name, format_type)
 
-def get_default_frame_rate() -> int:
-    """Get default frame rate setting."""
-    return app_config.sequence.default_frame_rate
